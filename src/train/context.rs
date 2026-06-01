@@ -3,6 +3,7 @@
 use burn::module::Module;
 use burn::record::CompactRecorder;
 use eyre::{Result, WrapErr};
+use std::path::{Path, PathBuf};
 
 use crate::config::ModelConfig;
 use crate::model::GabrielLaevis;
@@ -13,7 +14,7 @@ pub type Device = burn::tensor::Device<crate::Compute>;
 pub struct TrainingContext {
     pub device: Device,
     pub tokenizer: fastokens::Tokenizer,
-    pub artifact: String,
+    pub artifact: PathBuf,
 }
 
 impl TrainingContext {
@@ -21,10 +22,13 @@ impl TrainingContext {
     /// the dir must exist first so a freshly fetched tokenizer can be packaged into it.
     pub fn new() -> Result<Self> {
         let artifact = crate::config::artifact_dir();
+
         std::fs::create_dir_all(&artifact)
-            .wrap_err_with(|| format!("creating artifact dir {artifact}"))?;
+            .wrap_err_with(|| format!("creating artifact dir {}", artifact.display()))?;
+
         let tokenizer = crate::data::load_tokenizer(crate::constants::TOKENIZER_REPO)
             .wrap_err("loading tokenizer")?;
+
         Ok(Self {
             device: Default::default(),
             tokenizer,
@@ -37,26 +41,27 @@ impl TrainingContext {
     }
 
     /// Absolute path to a named checkpoint inside the artifact dir.
-    pub fn checkpoint_path(&self, name: &str) -> String {
-        format!("{}/{name}", self.artifact)
+    pub fn checkpoint_path(&self, name: &str) -> PathBuf {
+        self.artifact.join(name)
     }
 
     /// Whether a named checkpoint exists. `CompactRecorder` writes `<name>.mpk`.
     pub fn has_checkpoint(&self, name: &str) -> bool {
-        std::path::Path::new(&format!("{}.mpk", self.checkpoint_path(name))).exists()
+        self.checkpoint_path(name).with_extension("mpk").exists()
     }
 
     /// Latest epoch with a saved checkpoint under `${MODEL_DIR}/checkpoint/`,
     /// or None if there's nothing to resume from.
-    pub fn latest_checkpoint_epoch(&self, dir: &str) -> Option<usize> {
-        let cp = std::path::Path::new(dir).join("checkpoint");
+    pub fn latest_checkpoint_epoch(&self, dir: impl AsRef<Path>) -> Option<usize> {
+        let cp = dir.as_ref().join("checkpoint");
         std::fs::read_dir(cp)
             .ok()?
             .filter_map(|e| e.ok())
             .filter_map(|e| {
                 let name = e.file_name();
                 let stem = name.to_str()?.strip_prefix("model-")?;
-                stem.split('.').next()?.parse::<usize>().ok()
+                let (epoch_str, _) = stem.split_once('.')?;
+                epoch_str.parse::<usize>().ok()
             })
             .max()
     }

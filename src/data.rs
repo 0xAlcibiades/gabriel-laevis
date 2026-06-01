@@ -17,7 +17,7 @@ use crate::config::artifact_dir;
 pub fn load_tokenizer(repo: &str) -> eyre::Result<fastokens::Tokenizer> {
     use hf_hub::api::sync::Api;
 
-    let packaged = format!("{}/tokenizer.json", artifact_dir());
+    let packaged = artifact_dir().join("tokenizer.json");
     let (raw, fetched) = match std::fs::read_to_string(&packaged) {
         Ok(s) => (s, false),
         Err(_) => {

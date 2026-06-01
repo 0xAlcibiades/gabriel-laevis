@@ -7,8 +7,8 @@
 //! costs a full upfront reference pass over the whole dataset for nothing. GRPO scores
 //! its reference the same way.)
 //!
-//!   loss = -log σ(β·((logπ_c - logπ_r) - (logref_c - logref_r)))
-//!        = softplus(-β·((logπ_c - logπ_r) - (logref_c - logref_r)))
+//!    loss = -log σ(β·((logπ_c - logπ_r) - (logref_c - logref_r)))
+//!         = softplus(-β·((logπ_c - logπ_r) - (logref_c - logref_r)))
 //!
 //! Run `train sft` first to produce `model_sft` + `config.json`.
 
@@ -63,20 +63,21 @@ impl<B: Backend> DpoModel<B> {
         ref_r: Tensor<B, 1>,
     ) -> ClassificationOutput<B> {
         // β·(Δπ - Δref).
-        let margin = pi_c.sub(pi_r).sub(ref_c.sub(ref_r)).mul_scalar(DPO_BETA); // [B]
+        let margin = ((pi_c - pi_r) - (ref_c - ref_r)) * DPO_BETA; // [B]
 
         // loss = -log σ(margin) = softplus(-margin).
-        let loss = activation::softplus(margin.clone().neg(), 1.0).mean();
+        let loss = activation::softplus(-margin.clone(), 1.0).mean();
 
-        // Frame as binary "is chosen preferred": logits [0, margin], target = 1,
-        // so accuracy = fraction with margin > 0 (the DPO reward accuracy).
-        let [b] = margin.dims();
+        // Frame as binary "is chosen preferred": logits [0, margin], target = 1, so
+        // accuracy = fraction with margin > 0 (the DPO reward accuracy).
         let device = margin.device();
-        let logits = Tensor::cat(
-            vec![Tensor::zeros([b, 1], &device), margin.reshape([b, 1])],
-            1,
-        ); // [B,2]
+        let margin_col = margin.unsqueeze_dim(1); // [B, 1]
+
+        let logits = Tensor::cat(vec![Tensor::zeros_like(&margin_col), margin_col], 1); // [B, 2]
+
+        let [b, _] = logits.dims();
         let targets = Tensor::<B, 1, Int>::ones([b], &device);
+
         ClassificationOutput::new(loss, logits, targets)
     }
 
@@ -118,6 +119,7 @@ impl<B: AutodiffBackend> DpoModel<B> {
             self.policy.forward(batch.rejected_in.clone()),
             batch.rejected_tgt.clone(),
         );
+
         let reference = self.reference.valid(); // inner-backend module, no autograd
         let ref_c = Tensor::from_inner(sequence_logprob(
             reference.forward(batch.chosen_in.inner()),
@@ -127,6 +129,7 @@ impl<B: AutodiffBackend> DpoModel<B> {
             reference.forward(batch.rejected_in.inner()),
             batch.rejected_tgt.inner(),
         ));
+
         Self::assemble(pi_c, pi_r, ref_c, ref_r)
     }
 }
@@ -169,31 +172,28 @@ pub fn run(
         load_dpo_triples(DPO_REPO, DPO_FILE, max_examples).wrap_err("loading dpo data")?;
     println!("tokenizing + scoring {} preference pairs...", triples.len());
 
-    // Build chosen+rejected together per triple, dropping the whole triple if either
-    // side has a byte the frozen-vocab tokenizer can't encode — this keeps the two row
-    // lists aligned (they're zipped below) and skips unencodable data instead of aborting.
     let total = triples.len();
-    let (chosen_rows, rejected_rows): (Vec<_>, Vec<_>) = triples
-        .iter()
+
+    // Build chosen+rejected together per triple into one DpoExample, dropping the whole
+    // triple if either side has a byte the frozen-vocab tokenizer can't encode — so the
+    // two sides stay paired, and unencodable data is skipped instead of aborting.
+    let examples: Vec<DpoExample> = triples
+        .into_iter()
         .filter_map(|(p, c, r)| {
-            let chosen = build_sft_row(&ctx.tokenizer, p, c, DPO_SEQ_LEN).ok()?;
-            let rejected = build_sft_row(&ctx.tokenizer, p, r, DPO_SEQ_LEN).ok()?;
-            Some((chosen, rejected))
+            let chosen = build_sft_row(&ctx.tokenizer, &p, &c, DPO_SEQ_LEN).ok()?;
+            let rejected = build_sft_row(&ctx.tokenizer, &p, &r, DPO_SEQ_LEN).ok()?;
+            Some(DpoExample { chosen, rejected })
         })
-        .unzip();
-    if chosen_rows.len() < total {
-        println!("skipped {} unencodable pairs", total - chosen_rows.len());
+        .collect();
+
+    if examples.len() < total {
+        println!("skipped {} unencodable pairs", total - examples.len());
     }
 
-    let examples: Vec<DpoExample> = chosen_rows
-        .into_iter()
-        .zip(rejected_rows)
-        .map(|(chosen, rejected)| DpoExample { chosen, rejected })
-        .collect();
     let (examples, valid_examples) = split_valid(examples, VALID_EXAMPLES);
 
     // Policy + frozen reference, both from the same base checkpoint. The reference's
-    // forward is detached in the step, so it never updates.
+    // forward runs on the inner backend in the step, so it never updates.
     let load = |what: &str| {
         GabrielLaevis::<crate::Train>::new(&cfg, &ctx.device)
             .load_file(
@@ -203,6 +203,7 @@ pub fn run(
             )
             .wrap_err_with(|| format!("loading {base} as {what} (run `train sft` first)"))
     };
+
     let model = DpoModel {
         policy: load("policy")?,
         reference: load("reference")?,
@@ -226,6 +227,7 @@ pub fn run(
             DpoDataset::new(examples),
             sched.epoch_samples,
         ));
+
     let valid = DataLoaderBuilder::new(DpoBatcher)
         .batch_size(BATCH_SIZE)
         .num_workers(NUM_WORKERS)
@@ -252,6 +254,7 @@ pub fn run(
     let result = training.launch(Learner::new(model, AdamConfig::new().init(), LR));
     ctx.save_model(result.model.policy, "model_dpo")
         .wrap_err("saving dpo model")?;
-    println!("saved DPO model to {}", ctx.checkpoint_path("model_dpo"));
+
+    println!("saved DPO model to {:?}", ctx.checkpoint_path("model_dpo"));
     Ok(())
 }

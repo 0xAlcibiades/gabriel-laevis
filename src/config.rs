@@ -2,6 +2,7 @@
 
 use burn::config::Config;
 use serde::Deserialize;
+use std::path::PathBuf;
 
 /// Architecture dimensions for one model.
 #[derive(Config, Debug)]
@@ -99,8 +100,10 @@ impl Default for ModelConfig {
 /// Output, checkpoint, and token-cache directory. Set `MODEL_DIR` to override the
 /// `/tmp/gabriel-laevis` default. Every command reads this. Dataset and tokenizer
 /// downloads use the standard Hugging Face cache under `HF_HOME`.
-pub fn artifact_dir() -> String {
-    std::env::var("MODEL_DIR").unwrap_or_else(|_| "/tmp/gabriel-laevis".to_string())
+pub fn artifact_dir() -> PathBuf {
+    std::env::var_os("MODEL_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/tmp/gabriel-laevis"))
 }
 
 /// One training run's configuration: model size, data shards, and the memory and
@@ -118,6 +121,8 @@ pub struct RunConfig {
     pub d_ff: usize,
     pub expand: usize,
     pub max_seq_len: usize,
+    /// Std of the N(0, std) embedding initializer (see `ModelConfig::init_std`).
+    pub init_std: f64,
     /// Pretrain batch size. Dominates LM-head memory; lower it on tight machines.
     pub batch: usize,
     /// SSD scan chunk length. Keep at most 48 for f32 rescale precision.
@@ -132,15 +137,18 @@ pub struct RunConfig {
 
 impl Default for RunConfig {
     fn default() -> Self {
+        // Arch dims share one source of truth with ModelConfig, so the two can't drift.
+        let m = ModelConfig::new();
         Self {
-            d_model: 384,
-            n_layers: 12,
-            d_state: 128,
-            headdim: 64,
-            ngroups: 1,
-            d_ff: 1024,
-            expand: 2,
-            max_seq_len: 2048,
+            d_model: m.d_model,
+            n_layers: m.n_layers,
+            d_state: m.d_state,
+            headdim: m.headdim,
+            ngroups: m.ngroups,
+            d_ff: m.d_ff,
+            expand: m.expand,
+            max_seq_len: m.max_seq_len,
+            init_std: m.init_std,
             batch: 16,
             chunk: 32,
             cache_groups: 8,
@@ -162,6 +170,7 @@ impl RunConfig {
             .with_d_ff(self.d_ff)
             .with_expand(self.expand)
             .with_max_seq_len(self.max_seq_len)
+            .with_init_std(self.init_std)
     }
 
     fn load() -> Self {

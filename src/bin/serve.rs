@@ -120,15 +120,11 @@ async fn main() -> Result<()> {
     let tokenizer = Arc::new(load_tokenizer(TOKENIZER_REPO).wrap_err("loading tokenizer")?);
     let stop_token = gabriel_laevis_0::data::im_end_id(tokenizer.as_ref());
 
-    let cfg = ModelConfig::load(format!("{artifact}/config.json")).wrap_err("loading config")?;
+    let cfg = ModelConfig::load(artifact.join("config.json")).wrap_err("loading config")?;
     cfg.validate()?;
 
     let model = GabrielLaevis::<Compute>::new(&cfg, &device)
-        .load_file(
-            format!("{artifact}/{checkpoint}"),
-            &CompactRecorder::new(),
-            &device,
-        )
+        .load_file(artifact.join(&checkpoint), &CompactRecorder::new(), &device)
         .wrap_err_with(|| format!("loading checkpoint '{checkpoint}'"))?;
 
     let state = Arc::new(AppState {

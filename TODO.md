@@ -25,13 +25,6 @@ anneal, and vocab-shrink are independent and none touch `mamba3.rs`; vocab-shrin
 anneal fold into one re-pretrain. Scale (params) is the separate, dominant lever for the
 SOTA goal — these are what you lock cheaply at small scale first.
 
-- [ ] **ZClip adaptive gradient clipping.** Replace the fixed `GRAD_CLIP_NORM = 1.0`
-      (pretrain) with z-score spike detection on the EMA mean/std of the gradient norm — clip
-      only when `z > ~2.5`, reciprocal adjustment. Enables ~10× higher LR → same loss in far
-      fewer steps, eliminates loss spikes, no per-model threshold tuning. Needs a custom
-      learner step (Burn's `GradientClippingConfig::Norm` is fixed-threshold only). Cheap and
-      compounds — it speeds every experiment after it. Ref: _ZClip: Adaptive Spike Mitigation
-      for LLM Pre-Training_, arXiv:2504.02507.
 - [ ] **Multi-stage pretrain + decay anneal.** Vary the dataloader mix over training
       instead of one static blend: web-heavy bulk early, then upweight the highest-quality +
       math/reasoning data during the cosine-LR decay tail. Nearly free given we already run a
