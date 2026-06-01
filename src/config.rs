@@ -127,12 +127,17 @@ pub struct RunConfig {
     pub batch: usize,
     /// SSD scan chunk length. Keep at most 48 for f32 rescale precision.
     pub chunk: usize,
-    /// Row groups held tokenized at once by the streaming corpus cache. Memory ≈ this ×
-    /// one row group's token size; raise it freely on a big box (re-tokenizing a missed
-    /// group is cheap), it just bounds peak RAM so the corpus never lands whole.
     pub cache_groups: u64,
-    /// FineWeb-Edu shard files, concatenated in order for pretraining.
     pub shards: Vec<String>,
+    pub math_repo: String,
+    pub math_revision: String,
+    pub math_shards: Vec<String>,
+    pub math_text_column: String,
+    pub code_repo: String,
+    pub code_revision: String,
+    pub code_shards: Vec<String>,
+    pub code_blob_column: String,
+    pub code_max_files: usize,
 }
 
 impl Default for RunConfig {
@@ -153,6 +158,15 @@ impl Default for RunConfig {
             chunk: 32,
             cache_groups: 8,
             shards: vec![crate::constants::FINEWEB_SHARD.to_string()],
+            math_repo: crate::constants::FINEMATH_REPO.to_string(),
+            math_revision: "refs/convert/parquet".to_string(),
+            math_shards: vec![crate::constants::FINEMATH_SHARD.to_string()],
+            math_text_column: "text".to_string(),
+            code_repo: crate::constants::STACK_EDU_REPO.to_string(),
+            code_revision: "refs/convert/parquet".to_string(),
+            code_shards: vec![crate::constants::STACK_EDU_SHARD.to_string()],
+            code_blob_column: "blob_id".to_string(),
+            code_max_files: 4096,
         }
     }
 }
@@ -182,7 +196,9 @@ impl RunConfig {
             config::Environment::with_prefix("GL")
                 .try_parsing(true)
                 .list_separator(",")
-                .with_list_parse_key("shards"),
+                .with_list_parse_key("shards")
+                .with_list_parse_key("math_shards")
+                .with_list_parse_key("code_shards"),
         );
         // Defaults fill anything unset; a malformed source falls back to defaults.
         builder

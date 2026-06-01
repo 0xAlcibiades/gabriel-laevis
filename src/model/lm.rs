@@ -67,7 +67,17 @@ impl<B: Backend> GabrielLaevis<B> {
         logits.reshape([b, t, self.vocab_size])
     }
 
-    /// Next-token cross-entropy over a batch, packaged for the Learner's metrics.
+    /// Next-token cross-entropy over a batch, packaged for the Learner's metrics. Shared
+    /// by pretrain and SFT.
+    ///
+    /// Reduction (and why SFT needs no separate "sum loss"): logits/targets are flattened
+    /// to `[B*T]` and Burn's padded CE zeroes the `IGNORE_ID` positions, then means over
+    /// the *full* `B*T` — i.e. `Σ(response-token NLL) / (B*T)`, a constant denominator. So
+    /// every response token is weighted equally and longer responses contribute
+    /// proportionally more: exactly the length-equitable Tulu-3 "sum" behavior, differing
+    /// from a literal `sum()` only by the constant `B*T` (an LR rescale). The short-response
+    /// -dominance pathology comes from a per-*sequence* mean (each example normalized by its
+    /// own length); this flattened global mean never does that.
     pub fn forward_training(&self, batch: Batch<B>) -> ClassificationOutput<B> {
         let [b, t] = batch.inputs.dims();
         let v = self.vocab_size;

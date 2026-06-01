@@ -3,9 +3,22 @@
 /// Byte-level BPE tokenizer.
 pub const TOKENIZER_REPO: &str = "HuggingFaceTB/SmolLM2-135M";
 
-/// Pretraining corpus.
+/// Pretraining corpus (web).
 pub const FINEWEB_REPO: &str = "HuggingFaceFW/fineweb-edu";
 pub const FINEWEB_SHARD: &str = "sample/10BT/000_00000.parquet";
+
+/// Math corpus for the multi-stage decay anneal. FineMath exposes a `text` column, so it
+/// drops into the streaming loader; its shards live on the auto-converted parquet ref.
+/// On by default (see `RunConfig`); `GL_MATH_SHARDS=""` disables it.
+pub const FINEMATH_REPO: &str = "HuggingFaceTB/finemath";
+pub const FINEMATH_SHARD: &str = "finemath-3plus/train/0000.parquet";
+
+/// Code corpus. Stack-Edu ships SWHIDs (`blob_id`) + metadata, NOT code text — content
+/// lives on Software Heritage's S3 (`content/{blob_id}`, gzipped), fetched per file by
+/// `SoftwareHeritageSource`. On by default but capped (`RunConfig::code_max_files`), since
+/// each file is an HTTP GET.
+pub const STACK_EDU_REPO: &str = "HuggingFaceTB/stack-edu";
+pub const STACK_EDU_SHARD: &str = "Python/train/0000.parquet";
 
 /// SFT corpus.
 pub const SFT_REPO: &str = "OpenAssistant/oasst_top1_2023-08-25";

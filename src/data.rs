@@ -6,8 +6,10 @@
 //! `Batcher` live together.
 
 use std::fs::File;
+use std::io::Read;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use burn::data::dataloader::batcher::Batcher;
 use burn::data::dataset::Dataset;
@@ -15,6 +17,7 @@ use burn::prelude::*;
 use eyre::{Result, WrapErr};
 use parquet::file::reader::{FileReader, SerializedFileReader};
 use parquet::record::{Row, RowAccessor};
+use rayon::prelude::*;
 
 use crate::config::artifact_dir;
 
@@ -244,11 +247,12 @@ pub struct ParquetShard {
 }
 
 impl ParquetShard {
-    /// Open a local parquet file and read its metadata.
-    pub fn open(path: PathBuf) -> Result<Self> {
+    /// Open a local parquet file and read its metadata, reading documents from the column
+    /// named `text_column` (FineWeb/FineMath use `text`; another corpus may differ).
+    pub fn open(path: PathBuf, text_column: &str) -> Result<Self> {
         let file = File::open(&path).wrap_err("opening parquet shard")?;
         let reader = SerializedFileReader::new(file).wrap_err("opening parquet reader")?;
-        let text_idx = column_index(&reader, "text")?;
+        let text_idx = column_index(&reader, text_column)?;
         let num_groups = reader.metadata().num_row_groups();
         Ok(Self {
             path,
@@ -257,11 +261,21 @@ impl ParquetShard {
         })
     }
 
-    /// Fetch shard `file` from `repo` via the HF cache, then open it.
-    pub fn from_hub(repo: &str, file: &str) -> Result<Self> {
+    /// Fetch shard `file` from `repo` at git `revision` via the HF cache, then open it on
+    /// `text_column`. `revision` selects the branch/ref the shard lives on — `"main"` for
+    /// natively-laid-out repos (FineWeb), `"refs/convert/parquet"` for the auto-converted
+    /// parquet shards (FineMath).
+    pub fn from_hub(repo: &str, file: &str, text_column: &str, revision: &str) -> Result<Self> {
         use hf_hub::api::sync::Api;
-        let path = Api::new()?.dataset(repo.to_string()).get(file)?;
-        Self::open(path)
+        use hf_hub::{Repo, RepoType};
+        let path = Api::new()?
+            .repo(Repo::with_revision(
+                repo.to_string(),
+                RepoType::Dataset,
+                revision.to_string(),
+            ))
+            .get(file)?;
+        Self::open(path, text_column)
     }
 }
 
@@ -286,6 +300,176 @@ impl RowGroupSource for ParquetShard {
             })
             .collect()
     }
+}
+
+/// Blobs fetched per `group_texts` call (one HTTP GET each, run in parallel). Also the
+/// granularity of the row-group cache, so a miss re-fetches at most this many files.
+const SWH_GROUP_SIZE: usize = 256;
+
+/// A code corpus whose parquet ships **Software-Heritage IDs**, not text (e.g. Stack-Edu):
+/// each row is a `blob_id` whose content lives at `content/{blob_id}` (gzipped) in
+/// Software Heritage's public S3 bucket. Construction reads up to `max_files` blob ids
+/// from the shard (cheap, local); `group_texts` fetches a batch of them over HTTPS and
+/// gunzips. A per-blob fetch failure drops that file (empty string) rather than aborting.
+pub struct SoftwareHeritageSource {
+    blob_ids: Vec<String>,
+}
+
+impl SoftwareHeritageSource {
+    /// Fetch the Stack-Edu-style shard `file` from `repo`@`revision`, then read up to
+    /// `max_files` ids from its `blob_column`.
+    pub fn from_hub(
+        repo: &str,
+        revision: &str,
+        file: &str,
+        blob_column: &str,
+        max_files: usize,
+    ) -> Result<Self> {
+        use hf_hub::api::sync::Api;
+        use hf_hub::{Repo, RepoType};
+        let path = Api::new()?
+            .repo(Repo::with_revision(
+                repo.to_string(),
+                RepoType::Dataset,
+                revision.to_string(),
+            ))
+            .get(file)?;
+        let reader = SerializedFileReader::new(File::open(&path).wrap_err("opening code shard")?)
+            .wrap_err("opening parquet reader")?;
+        let idx = column_index(&reader, blob_column)?;
+
+        let mut blob_ids = Vec::with_capacity(max_files.min(1 << 16));
+        'outer: for g in 0..reader.num_row_groups() {
+            let group = reader.get_row_group(g).wrap_err("reading row group")?;
+            for record in group.get_row_iter(None).wrap_err("row iterator")? {
+                let row = record.wrap_err("decoding parquet row")?;
+                if let Ok(id) = row.get_string(idx) {
+                    blob_ids.push(id.clone());
+                    if blob_ids.len() >= max_files {
+                        break 'outer;
+                    }
+                }
+            }
+        }
+        Ok(Self { blob_ids })
+    }
+}
+
+/// Max blob fetches in flight at once against Software Heritage's S3.
+const SWH_CONCURRENCY: usize = 32;
+
+/// Process-wide async HTTP client (connection-pooled) for the SWH fetches, built once.
+fn swh_client() -> Result<&'static reqwest::Client> {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    if let Some(client) = CLIENT.get() {
+        return Ok(client);
+    }
+    let client = reqwest::Client::builder()
+        .build()
+        .wrap_err("building swh http client")?;
+    Ok(CLIENT.get_or_init(|| client))
+}
+
+/// Process-wide runtime that drives the async fetches. The streaming dataset's
+/// `group_texts` is a synchronous call (from the count pass and from dataloader worker
+/// threads), so it `block_on`s this runtime; the threads are never themselves inside a
+/// runtime, so blocking on it is safe.
+fn swh_runtime() -> Result<&'static tokio::runtime::Runtime> {
+    static RT: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+    if let Some(rt) = RT.get() {
+        return Ok(rt);
+    }
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()
+        .wrap_err("building swh runtime")?;
+    Ok(RT.get_or_init(|| rt))
+}
+
+/// Fetch one blob's content from Software Heritage's public S3 bucket and gunzip it.
+/// Objects are stored gzipped and served as `application/octet-stream` with no
+/// `Content-Encoding`, so the body is the raw gzip stream (decoded here). Bytes are
+/// decoded lossily — Stack-Edu spans many source encodings and the byte-level BPE
+/// tokenizer is encoding-agnostic anyway.
+async fn fetch_one(client: &reqwest::Client, blob_id: &str) -> Result<String> {
+    let url = format!("https://softwareheritage.s3.amazonaws.com/content/{blob_id}");
+    let gz = client
+        .get(&url)
+        .send()
+        .await
+        .and_then(reqwest::Response::error_for_status)
+        .map_err(|e| eyre::eyre!("swh fetch {blob_id}: {e}"))?
+        .bytes()
+        .await
+        .wrap_err("reading swh response")?;
+    let mut bytes = Vec::new();
+    flate2::read::GzDecoder::new(&gz[..])
+        .read_to_end(&mut bytes)
+        .wrap_err("gunzip swh blob")?;
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// Fetch `blob_ids` concurrently (≤ `SWH_CONCURRENCY` in flight), preserving input order
+/// — the count pass and the load path concatenate a group's docs, so the order must be
+/// deterministic. A failed fetch becomes an empty document (no tokens) rather than fatal.
+fn fetch_swh_blobs(blob_ids: &[String]) -> Result<Vec<String>> {
+    let client = swh_client()?;
+    let out = swh_runtime()?.block_on(async move {
+        let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(SWH_CONCURRENCY));
+        let mut set = tokio::task::JoinSet::new();
+        for (i, id) in blob_ids.iter().cloned().enumerate() {
+            let client = client.clone();
+            let sem = sem.clone();
+            set.spawn(async move {
+                // The semaphore is never closed, so acquire can't really fail; if it
+                // somehow did, drop this blob rather than the whole group.
+                let Ok(_permit) = sem.acquire_owned().await else {
+                    return (i, String::new());
+                };
+                (i, fetch_one(&client, &id).await.unwrap_or_default())
+            });
+        }
+        let mut out = vec![String::new(); blob_ids.len()];
+        while let Some(joined) = set.join_next().await {
+            if let Ok((i, text)) = joined {
+                out[i] = text;
+            }
+        }
+        out
+    });
+    Ok(out)
+}
+
+impl RowGroupSource for SoftwareHeritageSource {
+    fn num_groups(&self) -> usize {
+        self.blob_ids.len().div_ceil(SWH_GROUP_SIZE).max(1)
+    }
+
+    fn group_texts(&self, g: usize) -> Result<Vec<String>> {
+        let start = g * SWH_GROUP_SIZE;
+        let end = (start + SWH_GROUP_SIZE).min(self.blob_ids.len());
+        if start >= end {
+            return Ok(Vec::new());
+        }
+        // One HTTP GET per blob, fetched concurrently; a failed fetch becomes an empty
+        // document (contributes no tokens to the dense packing) instead of failing the run.
+        fetch_swh_blobs(&self.blob_ids[start..end])
+    }
+}
+
+/// Tokenize a row group's documents, **dropping any the frozen-vocab tokenizer can't
+/// encode** (an out-of-vocab byte/char in a doc makes it empty — contributing no tokens —
+/// rather than aborting the whole corpus; FineMath/Stack-Edu carry chars SmolLM2's vocab
+/// lacks). Per-doc `encode` is byte-identical to `encode_batch(_, false)` for encodable
+/// docs (see fastokens' own `encode_batch_matches_sequential`), so the only change vs the
+/// batch call is that a bad doc is skipped. The count pass and the load path both go
+/// through here, so per-group token counts and the materialized stream stay consistent.
+fn encode_group(tokenizer: &fastokens::Tokenizer, texts: &[String]) -> Vec<Vec<u32>> {
+    texts
+        .par_iter()
+        .map(|t| tokenizer.encode(t).unwrap_or_default())
+        .collect()
 }
 
 /// Seekable streaming corpus: dense `seq_len+1` windows packed per row group,
@@ -320,9 +504,7 @@ impl StreamingTokenDataset {
             let mut counts = Vec::with_capacity(n_groups);
             for g in 0..n_groups {
                 let texts = src.group_texts(g)?;
-                let toks = tokenizer
-                    .encode_batch(&texts, false)
-                    .wrap_err("tokenizing row group (count pass)")?;
+                let toks = encode_group(&tokenizer, &texts);
                 counts.push(toks.iter().map(|t| t.len()).sum());
             }
             per_source_group_tokens.push(counts);
@@ -339,17 +521,25 @@ impl StreamingTokenDataset {
         })
     }
 
-    /// Fetch + open the listed FineWeb shards and build the dataset.
+    /// Fetch + open the listed shards from `repo` at git `revision` (reading documents
+    /// from `text_column`) and build the dataset.
     pub fn from_hub(
         tokenizer: Arc<fastokens::Tokenizer>,
         repo: &str,
+        revision: &str,
         files: &[String],
+        text_column: &str,
         seq_len: usize,
         cache_groups: u64,
     ) -> Result<Self> {
         let mut sources: Vec<Box<dyn RowGroupSource>> = Vec::with_capacity(files.len());
         for file in files {
-            sources.push(Box::new(ParquetShard::from_hub(repo, file)?));
+            sources.push(Box::new(ParquetShard::from_hub(
+                repo,
+                file,
+                text_column,
+                revision,
+            )?));
         }
         Self::new(sources, tokenizer, seq_len, cache_groups)
     }
@@ -375,10 +565,7 @@ impl StreamingTokenDataset {
     fn load_group(&self, group_idx: usize) -> Result<Arc<Vec<u32>>> {
         let gw = self.index[group_idx];
         let texts = self.sources[gw.source].group_texts(gw.group)?;
-        let toks = self
-            .tokenizer
-            .encode_batch(&texts, false)
-            .wrap_err("tokenizing row group")?;
+        let toks = encode_group(&self.tokenizer, &texts);
         let mut stream = Vec::with_capacity(toks.iter().map(|t| t.len()).sum());
         for t in &toks {
             stream.extend_from_slice(t);
@@ -409,6 +596,143 @@ impl Dataset<Vec<i64>> for StreamingTokenDataset {
 
     fn len(&self) -> usize {
         self.len
+    }
+}
+
+// --- Multi-stage data mix (decay anneal) ---
+//
+// Vary the domain mix over training instead of one static blend: web-heavy early, then
+// upweight math/code over the cosine-LR decay tail (SmolLM3's multi-stage recipe). The
+// mechanism is a `MixtureDataset` wrapping one `StreamingTokenDataset` per domain plus a
+// shared atomic counter of items drawn; each `get` reads the current progress fraction,
+// interpolates the domain weights for it, picks a domain, and draws a window from it.
+// This composes with `SamplerDataset` + Burn's `SupervisedTraining` (which owns the epoch
+// loop) without a custom training loop. Progress is approximate — worker prefetch runs a
+// little ahead, and a resume restarts the counter — but the ramp is coarse, so neither
+// matters. The held-out valid set stays a single fixed domain (see `pretrain`) so the
+// metric is comparable across the run.
+
+/// SplitMix64: turn the (already-random) sampler index into two independent uniform
+/// streams — one to pick the domain, one to pick a window within it.
+fn splitmix64(mut x: u64) -> u64 {
+    x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut z = x;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
+/// Pick an index in `0..weights.len()` by the (unnormalized) `weights`, using a uniform
+/// `u ∈ [0,1)`. Empty/zero weights resolve to domain 0.
+fn pick_domain(weights: &[f64], u: f64) -> usize {
+    let total: f64 = weights.iter().sum();
+    if total <= 0.0 {
+        return 0;
+    }
+    let target = u * total;
+    let mut acc = 0.0;
+    for (i, w) in weights.iter().enumerate() {
+        acc += w;
+        if target < acc {
+            return i;
+        }
+    }
+    weights.len() - 1
+}
+
+/// Domain mix weights as a function of training progress: a constant `stable` blend until
+/// `decay_start`, then a linear ramp to the `decay` blend by the end. Both weight vectors
+/// are indexed by domain in the same order as `MixtureDataset::new`'s `domains`.
+#[derive(Clone, Debug)]
+pub struct MixSchedule {
+    stable: Vec<f64>,
+    decay: Vec<f64>,
+    decay_start: f64,
+}
+
+impl MixSchedule {
+    /// `decay_start` is the progress fraction (`0.0..1.0`) where the ramp begins; before
+    /// it the mix is `stable`, at progress 1.0 the mix is `decay`.
+    pub fn new(stable: Vec<f64>, decay: Vec<f64>, decay_start: f64) -> Self {
+        debug_assert_eq!(
+            stable.len(),
+            decay.len(),
+            "stable/decay domain counts differ"
+        );
+        Self {
+            stable,
+            decay,
+            decay_start: decay_start.clamp(0.0, 1.0),
+        }
+    }
+
+    /// Per-domain weights at `progress ∈ [0,1]`, linearly interpolated over the decay tail.
+    pub fn weights_at(&self, progress: f64) -> Vec<f64> {
+        let t = if progress <= self.decay_start {
+            0.0
+        } else {
+            ((progress - self.decay_start) / (1.0 - self.decay_start).max(f64::EPSILON))
+                .clamp(0.0, 1.0)
+        };
+        self.stable
+            .iter()
+            .zip(&self.decay)
+            .map(|(s, d)| s + (d - s) * t)
+            .collect()
+    }
+}
+
+/// A progress-weighted mixture over per-domain streaming corpora. Cheap to clone — clones
+/// share the same domains and the same progress counter (so multi-worker dataloaders
+/// advance one shared progress).
+#[derive(Clone)]
+pub struct MixtureDataset {
+    domains: Vec<StreamingTokenDataset>,
+    schedule: MixSchedule,
+    consumed: Arc<AtomicU64>,
+    /// Planned total items drawn across the run (denominator for progress).
+    total: u64,
+    /// Sum of domain window counts — the index range exposed to the sampler.
+    len: usize,
+}
+
+impl MixtureDataset {
+    pub fn new(
+        domains: Vec<StreamingTokenDataset>,
+        schedule: MixSchedule,
+        total_draws: u64,
+    ) -> Self {
+        let len = domains.iter().map(|d| d.len()).sum();
+        Self {
+            domains,
+            schedule,
+            consumed: Arc::new(AtomicU64::new(0)),
+            total: total_draws.max(1),
+            len,
+        }
+    }
+}
+
+impl Dataset<Vec<i64>> for MixtureDataset {
+    fn get(&self, index: usize) -> Option<Vec<i64>> {
+        let step = self.consumed.fetch_add(1, Ordering::Relaxed);
+        let progress = (step as f64 / self.total as f64).min(1.0);
+        let weights = self.schedule.weights_at(progress);
+
+        let h = splitmix64(index as u64);
+        let u = (h >> 11) as f64 / (1u64 << 53) as f64; // uniform [0,1)
+        let d = pick_domain(&weights, u);
+        let dom = &self.domains[d];
+        let dlen = dom.len();
+        if dlen == 0 {
+            return None;
+        }
+        let w = (splitmix64(h ^ 0xD1B5_4A32_D192_ED03) as usize) % dlen;
+        dom.get(w)
+    }
+
+    fn len(&self) -> usize {
+        self.len.max(1)
     }
 }
 
@@ -834,5 +1158,117 @@ mod tests {
                 "valid view offset maps to global a"
             );
         }
+    }
+
+    #[test]
+    fn streaming_skips_unencodable_documents() {
+        let tok = Arc::new(load_tokenizer(crate::constants::TOKENIZER_REPO).unwrap());
+        // Precondition: the fixture really does contain a byte the frozen vocab can't encode.
+        // Control char 0x06 is one such (FineMath/Stack-Edu carry these; the count pass used
+        // to abort on them — the tokenizer reports it as its byte-char alias 'Ć').
+        assert!(
+            tok.encode("\u{0006}").is_err(),
+            "fixture is not actually unencodable"
+        );
+
+        let seq_len = 7;
+        let para = "the quick brown fox jumps over the lazy dog again and again ";
+        // A group mixing an encodable doc with an unencodable one must build (bad doc
+        // dropped to empty), not error out as `encode_batch` did.
+        let ds = StreamingTokenDataset::new(
+            vec![Box::new(FakeSource {
+                groups: vec![vec![para.repeat(4), "bad \u{0006} doc".to_string()]],
+            })],
+            tok,
+            seq_len,
+            8,
+        )
+        .expect("unencodable doc must be skipped, not fatal");
+        assert!(ds.len() > 0, "encodable content should still yield windows");
+        // Every window is a full, padding-free dense window (the bad doc added nothing).
+        for i in 0..ds.len() {
+            let win = ds.get(i).expect("in-range window");
+            assert_eq!(win.len(), seq_len + 1);
+        }
+    }
+
+    #[test]
+    fn mix_schedule_ramps_stable_to_decay() {
+        let s = MixSchedule::new(vec![0.85, 0.15], vec![0.5, 0.5], 0.8);
+        assert_eq!(s.weights_at(0.0), vec![0.85, 0.15]); // stable before the tail
+        assert_eq!(s.weights_at(0.8), vec![0.85, 0.15]); // ramp begins at decay_start
+        let mid = s.weights_at(0.9); // halfway through the 0.8..1.0 tail
+        assert!(
+            (mid[0] - 0.675).abs() < 1e-9 && (mid[1] - 0.325).abs() < 1e-9,
+            "{mid:?}"
+        );
+        let end = s.weights_at(1.0);
+        assert!(
+            (end[0] - 0.5).abs() < 1e-9 && (end[1] - 0.5).abs() < 1e-9,
+            "{end:?}"
+        );
+    }
+
+    #[test]
+    fn pick_domain_respects_weights() {
+        assert_eq!(pick_domain(&[1.0, 0.0, 0.0], 0.99), 0);
+        assert_eq!(pick_domain(&[0.0, 0.0, 1.0], 0.0), 2);
+        assert_eq!(pick_domain(&[0.0, 0.0, 1.0], 0.99), 2);
+        // 50/50: low u falls in the first half, high u in the second.
+        assert_eq!(pick_domain(&[0.5, 0.5], 0.1), 0);
+        assert_eq!(pick_domain(&[0.5, 0.5], 0.9), 1);
+        // Degenerate all-zero weights resolve to domain 0.
+        assert_eq!(pick_domain(&[0.0, 0.0], 0.5), 0);
+    }
+
+    #[test]
+    fn mixture_routes_draws_by_domain_weight() {
+        let tok = Arc::new(load_tokenizer(crate::constants::TOKENIZER_REPO).unwrap());
+        let seq_len = 7;
+        let para = "the quick brown fox jumps over the lazy dog again and again ";
+        let web = StreamingTokenDataset::new(
+            vec![Box::new(FakeSource {
+                groups: vec![vec![para.repeat(4)]],
+            })],
+            tok.clone(),
+            seq_len,
+            8,
+        )
+        .unwrap();
+        // A domain whose only doc is too short to fill one window → 0 windows.
+        let empty = StreamingTokenDataset::new(
+            vec![Box::new(FakeSource {
+                groups: vec![vec!["a".to_string()]],
+            })],
+            tok.clone(),
+            seq_len,
+            8,
+        )
+        .unwrap();
+        assert!(
+            web.len() > 0 && empty.len() == 0,
+            "fixture domains malformed"
+        );
+
+        // All weight on web → every draw is a full web window.
+        let all_web = MixtureDataset::new(
+            vec![web.clone(), empty.clone()],
+            MixSchedule::new(vec![1.0, 0.0], vec![1.0, 0.0], 0.8),
+            100,
+        );
+        for i in 0..20 {
+            assert_eq!(all_web.get(i).expect("web draw").len(), seq_len + 1);
+        }
+
+        // All weight on the empty domain → every draw routes there and yields None.
+        let all_empty = MixtureDataset::new(
+            vec![web, empty],
+            MixSchedule::new(vec![0.0, 1.0], vec![0.0, 1.0], 0.8),
+            100,
+        );
+        assert!(
+            (0..20).all(|i| all_empty.get(i).is_none()),
+            "empty-domain draws must be None"
+        );
     }
 }

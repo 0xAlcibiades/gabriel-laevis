@@ -31,7 +31,7 @@ model. Run either with `--help` for the full set of args.
 
 | Command              | What it does                               |
 | -------------------- | ------------------------------------------ |
-| `train pretrain`     | Pretrain on [FineWeb-Edu](https://huggingface.co/datasets/HuggingFaceFW/fineweb-edu) (next-token) |
+| `train pretrain`     | Pretrain on a decay-annealed web/math/code mix |
 | `train sft`          | Instruction-tune (ChatML, response-masked) |
 | `train dpo`          | Preference-optimize the SFT model          |
 | `train grpo`         | RL on [GSM8K](https://huggingface.co/datasets/openai/gsm8k) with a verifiable reward |
@@ -68,7 +68,9 @@ MIT
 **Models & data**
 
 - [SmolLM2](https://huggingface.co/HuggingFaceTB/SmolLM2-135M) — tokenizer and small-LM training reference.
-- [FineWeb-Edu](https://huggingface.co/datasets/HuggingFaceFW/fineweb-edu) — pretraining corpus.
+- [FineWeb-Edu](https://huggingface.co/datasets/HuggingFaceFW/fineweb-edu) — web pretraining corpus.
+- [FineMath](https://huggingface.co/datasets/HuggingFaceTB/finemath) — math/reasoning pretraining corpus.
+- [Stack-Edu](https://huggingface.co/datasets/HuggingFaceTB/stack-edu) — code pretraining corpus.
 - [OpenAssistant (oasst_top1)](https://huggingface.co/datasets/OpenAssistant/oasst_top1_2023-08-25) — SFT instruction data.
 - [orpo-dpo-mix-40k](https://huggingface.co/datasets/mlabonne/orpo-dpo-mix-40k-flat) — DPO preference data.
 - [GSM8K](https://huggingface.co/datasets/openai/gsm8k) — GRPO task.
