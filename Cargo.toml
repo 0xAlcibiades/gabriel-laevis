@@ -6,9 +6,9 @@ edition = "2024"
 [features]
 default = ["cpu"]
 cpu = ["burn/ndarray", "burn/train"]
-metal = ["burn/metal", "burn/train", "burn/autotune", "burn/fusion"]
-wgpu = ["burn/wgpu", "burn/train"]
-cuda = ["burn/cuda", "burn/fusion", "burn/autotune", "burn/train"]
+metal = ["burn/metal", "burn/autotune", "burn/fusion", "burn/train"]
+wgpu = ["burn/wgpu", "burn/autotune", "burn/fusion", "burn/train"]
+cuda = ["burn/cuda", "burn/autotune", "burn/fusion", "burn/train"]
 bf16 = []
 checkpoint = []
 
@@ -19,8 +19,8 @@ burn = { version = "0.21.0" }
 clap = { version = "4.6.1", features = ["derive"] }
 config = "0.15.23"
 eyre = "0.6"
-fastrand = "2"
 fastokens = "0.2"
+fastrand = "2"
 hf-hub = "0.5"
 kanal = { version = "0.1", features = ["async"] }
 moka = { version = "0.12", features = ["sync"] }

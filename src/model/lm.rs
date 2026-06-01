@@ -10,6 +10,7 @@ use burn::tensor::activation;
 use burn::tensor::backend::AutodiffBackend;
 use burn::train::{ClassificationOutput, InferenceStep, TrainOutput, TrainStep};
 use eyre::{Result, eyre};
+use rayon::prelude::*;
 
 use crate::config::ModelConfig;
 use crate::data::Batch;
@@ -278,7 +279,6 @@ impl<B: Backend> GabrielLaevis<B> {
             // Per-row noise filled in parallel: each thread owns one row's chunk and its
             // own PRNG, so there's no contention and no single-threaded g·vocab fill.
             let noise = row_rngs.as_mut().map(|rngs| {
-                use rayon::prelude::*;
                 let mut u = vec![0.0f32; g * vocab];
                 u.par_chunks_mut(vocab)
                     .zip(rngs.par_iter_mut())
