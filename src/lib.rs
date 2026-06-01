@@ -7,7 +7,6 @@ pub mod chat;
 pub mod config;
 pub mod constants;
 pub mod data;
-pub mod eval;
 pub mod model;
 pub mod train;
 

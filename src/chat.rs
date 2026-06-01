@@ -6,6 +6,14 @@
 /// a no-op for pretraining.
 pub const IGNORE_ID: usize = 0;
 
+/// Token id of the ChatML turn terminator `<|im_end|>`, used as the generation stop
+/// token (so completions end at the turn boundary instead of running to the length
+/// cap). Returns `None` if the tokenizer doesn't map it to a single id.
+pub fn im_end_id(tok: &fastokens::Tokenizer) -> Option<i64> {
+    let ids = tok.encode("<|im_end|>").ok()?;
+    (ids.len() == 1).then(|| ids[0] as i64)
+}
+
 /// Conversation role. `Developer` and `Tool` cover the instruction-hierarchy and
 /// tool-calling conventions; they render as plain ChatML role tags.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -18,7 +26,8 @@ pub enum Role {
 }
 
 impl Role {
-    fn tag(self) -> &'static str {
+    #[inline(always)]
+    const fn tag(self) -> &'static str {
         match self {
             Role::System => "system",
             Role::Developer => "developer",
@@ -39,6 +48,7 @@ pub struct Message {
 }
 
 impl Message {
+    #[inline]
     pub fn new(role: Role, content: impl Into<String>) -> Self {
         Self {
             role,
@@ -46,6 +56,8 @@ impl Message {
             thinking: None,
         }
     }
+
+    // Ergonomic constructors
     pub fn system(c: impl Into<String>) -> Self {
         Self::new(Role::System, c)
     }
@@ -61,6 +73,7 @@ impl Message {
     pub fn tool(c: impl Into<String>) -> Self {
         Self::new(Role::Tool, c)
     }
+
     pub fn with_thinking(mut self, t: impl Into<String>) -> Self {
         self.thinking = Some(t.into());
         self
@@ -68,21 +81,29 @@ impl Message {
 }
 
 /// Render a conversation to ChatML. With `add_generation_prompt`, append an open
-/// assistant turn for the model to continue.
+/// assistant turn for the model to continue. Sized up front into a single buffer.
 pub fn render(messages: &[Message], add_generation_prompt: bool) -> String {
-    let mut out = String::new();
+    // Estimate the buffer size to avoid reallocations (tags + content per turn).
+    let est_len: usize = messages.iter().map(|m| m.content.len() + 64).sum::<usize>()
+        + if add_generation_prompt { 32 } else { 0 };
+
+    let mut out = String::with_capacity(est_len);
+
     for m in messages {
         out.push_str("<|im_start|>");
         out.push_str(m.role.tag());
         out.push('\n');
-        if let Some(t) = &m.thinking {
+
+        if let Some(ref t) = m.thinking {
             out.push_str("<think>");
             out.push_str(t);
             out.push_str("</think>");
         }
+
         out.push_str(&m.content);
         out.push_str("<|im_end|>\n");
     }
+
     if add_generation_prompt {
         out.push_str("<|im_start|>assistant\n");
     }

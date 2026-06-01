@@ -1,12 +1,26 @@
-//! Data layer and loaders.
+//! Data layer: tokenizer, parquet ingestion, and the per-stage datasets/batchers.
+//!
+//! Layout, top to bottom: tokenizer loading → shared parquet helpers → generic
+//! batch/split helpers → pretraining (streaming corpus) → SFT → DPO → GRPO. Each
+//! training stage owns one section: its loader, example, `Dataset`, batch, and
+//! `Batcher` live together.
+
+use std::fs::File;
+use std::path::PathBuf;
+use std::sync::Arc;
 
 use burn::data::dataloader::batcher::Batcher;
 use burn::data::dataset::Dataset;
 use burn::prelude::*;
-use eyre::WrapErr;
-use std::sync::Arc;
+use eyre::{Result, WrapErr};
+use parquet::file::reader::{FileReader, SerializedFileReader};
+use parquet::record::{Row, RowAccessor};
 
 use crate::config::artifact_dir;
+
+// ===========================================================================
+// Tokenizer
+// ===========================================================================
 
 /// Load the byte-level BPE tokenizer, preferring the copy packaged beside the model
 /// in the artifact dir and falling back to fetching `repo` from HF. fastokens 0.2 can
@@ -14,10 +28,10 @@ use crate::config::artifact_dir;
 /// to the equivalent `Split` regex, preserving SmolLM2's digit splitting. The
 /// rewritten tokenizer is then written into the artifact dir, so a trained model is
 /// self-contained and later loads work offline.
-pub fn load_tokenizer(repo: &str) -> eyre::Result<fastokens::Tokenizer> {
+pub fn load_tokenizer(repo: &str) -> Result<fastokens::Tokenizer> {
     use hf_hub::api::sync::Api;
 
-    let packaged = format!("{}/tokenizer.json", artifact_dir());
+    let packaged = artifact_dir().join("tokenizer.json");
     let (raw, fetched) = match std::fs::read_to_string(&packaged) {
         Ok(s) => (s, false),
         Err(_) => {
@@ -25,74 +39,131 @@ pub fn load_tokenizer(repo: &str) -> eyre::Result<fastokens::Tokenizer> {
             (std::fs::read_to_string(path)?, true)
         }
     };
+
     let mut json: serde_json::Value = serde_json::from_str(&raw)?;
-    // Rewrite `Digits` → `Split`. Idempotent: a packaged copy is already rewritten.
-    if let Some(pretoks) = json
-        .pointer_mut("/pre_tokenizer/pretokenizers")
-        .and_then(|v| v.as_array_mut())
-    {
-        for p in pretoks.iter_mut() {
-            if p.get("type").and_then(|t| t.as_str()) == Some("Digits") {
-                // individual_digits → each digit its own pre-token `\d`, else split
-                // runs of digits `\d+`; behavior Isolated keeps them as tokens.
-                let individual = p
-                    .get("individual_digits")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(true);
-                *p = serde_json::json!({
-                    "type": "Split",
-                    "pattern": { "Regex": if individual { r"\d" } else { r"\d+" } },
-                    "behavior": "Isolated",
-                    "invert": false,
-                });
-            }
-        }
-    }
-    // The first time we fetch it, package the rewritten tokenizer beside the model so
-    // later loads — including `serve` — read it locally without hitting HF.
-    // Best-effort: a write failure just means the next load refetches.
+    rewrite_digits_pretokenizer(&mut json);
+
+    // First fetch: package the rewritten tokenizer beside the model so later loads —
+    // including `serve` — read it locally without hitting HF. Best-effort: a write
+    // failure just means the next load refetches.
     if fetched && let Ok(s) = serde_json::to_string(&json) {
         let _ = std::fs::write(&packaged, s);
     }
     Ok(fastokens::Tokenizer::from_json(json)?)
 }
 
-/// Token id of the ChatML turn terminator `<|im_end|>`, used as the generation stop
-/// token (so completions end at the turn boundary instead of running to the length
-/// cap). Returns `None` if the tokenizer doesn't map it to a single id.
-pub fn im_end_id(tok: &fastokens::Tokenizer) -> Option<i64> {
-    let ids = tok.encode("<|im_end|>").ok()?;
-    (ids.len() == 1).then(|| ids[0] as i64)
+/// Rewrite every `Digits` pre-tokenizer to the equivalent `Split` regex, in place.
+/// Idempotent: a packaged copy is already rewritten, so re-running is a no-op.
+fn rewrite_digits_pretokenizer(json: &mut serde_json::Value) {
+    let Some(pretoks) = json
+        .pointer_mut("/pre_tokenizer/pretokenizers")
+        .and_then(|v| v.as_array_mut())
+    else {
+        return;
+    };
+    for p in pretoks.iter_mut() {
+        if p.get("type").and_then(|t| t.as_str()) != Some("Digits") {
+            continue;
+        }
+        // individual_digits → each digit its own pre-token `\d`, else split runs of
+        // digits `\d+`; behavior Isolated keeps them as tokens.
+        let individual = p
+            .get("individual_digits")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+        *p = serde_json::json!({
+            "type": "Split",
+            "pattern": { "Regex": if individual { r"\d" } else { r"\d+" } },
+            "behavior": "Isolated",
+            "invert": false,
+        });
+    }
 }
 
+// ===========================================================================
+// Shared parquet ingestion
+// ===========================================================================
+//
+// The SFT/DPO/GRPO loaders all read a HF-hosted dataset parquet (the auto-converted
+// `refs/convert/parquet` revision), resolve a few columns by name, and iterate rows
+// until a cap. These three helpers factor out that shape so each loader is just its
+// column names plus a per-row extractor.
+
+/// Fetch + open a Hub dataset parquet file from the auto-converted parquet revision.
+fn open_hub_dataset_parquet(repo: &str, file: &str) -> Result<SerializedFileReader<File>> {
+    use hf_hub::api::sync::Api;
+    use hf_hub::{Repo, RepoType};
+
+    let path = Api::new()?
+        .repo(Repo::with_revision(
+            repo.to_string(),
+            RepoType::Dataset,
+            "refs/convert/parquet".to_string(),
+        ))
+        .get(file)?;
+    let file = File::open(&path).wrap_err("opening dataset parquet")?;
+    SerializedFileReader::new(file).wrap_err("opening parquet reader")
+}
+
+/// Index of the column named `name`, or a clean error naming the dataset and column.
+fn column_index(reader: &SerializedFileReader<File>, name: &str) -> Result<usize> {
+    reader
+        .metadata()
+        .file_metadata()
+        .schema_descr()
+        .columns()
+        .iter()
+        .position(|c| c.name() == name)
+        .ok_or_else(|| eyre::eyre!("parquet missing `{name}` column"))
+}
+
+/// Iterate rows across every row group, applying `extract` to each and collecting the
+/// `Some` results, stopping once `max` are gathered. `extract` returning `Ok(None)`
+/// skips a row without counting it; returning `Err` aborts the whole read.
+fn read_rows<T>(
+    reader: &SerializedFileReader<File>,
+    max: usize,
+    mut extract: impl FnMut(&Row) -> Result<Option<T>>,
+) -> Result<Vec<T>> {
+    let mut out = Vec::new();
+    for g in 0..reader.num_row_groups() {
+        let group = reader.get_row_group(g).wrap_err("reading row group")?;
+        for record in group.get_row_iter(None).wrap_err("row iterator")? {
+            let row = record.wrap_err("decoding parquet row")?;
+            if let Some(item) = extract(&row)? {
+                out.push(item);
+                if out.len() >= max {
+                    return Ok(out);
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+// ===========================================================================
+// Generic helpers shared across stages
+// ===========================================================================
+
 /// Split `rows` into `(train, valid)` with a **disjoint** held-out tail of up to
-/// `max_valid` rows.
+/// `max_valid` rows, capped at a fifth so a tiny run keeps a trainable majority.
 pub fn split_valid<T>(mut rows: Vec<T>, max_valid: usize) -> (Vec<T>, Vec<T>) {
     let n_valid = max_valid.min(rows.len() / 5);
     let valid = rows.split_off(rows.len() - n_valid);
     (rows, valid)
 }
 
-// --- Streaming, seekable pretraining corpus ---
-//
-// Tokenize on access, never hold the corpus in RAM, and pack densely (no padding).
-//
-// An item is one `seq_len+1` window cut from a row group's concatenated token stream —
-// the same dense packing the corpus always used, just produced per row group so memory
-// stays bounded. `get(i)` resolves the owning group, tokenizes+concatenates it once
-// (cached in a bounded moka cache), and slices window `i`. Memory is O(cache), not
-// O(corpus): viable for 5B+ tokens, and a 200 MB model never needs the corpus resident.
-// No on-disk token cache.
-//
-// Dense packing needs exact per-group window counts, which need token counts — so
-// construction does a streaming COUNT PASS: tokenize each group, record its token
-// count, discard the tokens. That's bounded (one group at a time, counts only — not the
-// "load it all" anti-pattern), and gives an exact `len()` plus seekable `get(i)`, so the
-// dataset composes with Burn's `ShuffledDataset`/`SamplerDataset` like an in-memory one.
-// Cost: tokenizing once to count (~50M tok/s → ~100s for 5B), plus cheap re-tokenize on
-// cache miss during training. Packing is within a group, so the only loss is each
-// group's < seq_len-token remainder — negligible for large FineWeb row groups. Docs are
-// concatenated without a separator, matching the prior loader.
+/// A training batch: `inputs` and next-token `targets`, both `[batch, seq_len]`.
+/// Shared by the pretraining and SFT batchers.
+#[derive(Clone, Debug)]
+pub struct Batch<B: Backend> {
+    pub inputs: Tensor<B, 2, Int>,
+    pub targets: Tensor<B, 2, Int>,
+}
+
+// ===========================================================================
+// Pretraining: streaming, seekable corpus
+// ===========================================================================
 
 /// One row group's contiguous block of dense windows in the flattened global window
 /// index: `n_windows` windows starting at global window `win_start`.
@@ -156,48 +227,38 @@ fn resolve_window(index: &[GroupWindows], gw: usize) -> Option<(usize, usize)> {
 /// tests use an in-memory fake. `Send + Sync` so the dataset works under multi-worker
 /// dataloaders.
 pub trait RowGroupSource: Send + Sync {
-    /// Rows in each row group, in order (defines the index; read from metadata only).
-    fn group_rows(&self) -> Vec<usize>;
+    /// Number of row groups (defines the index; read from metadata only).
+    fn num_groups(&self) -> usize;
     /// The `text` of every document in row group `g` (the only point that reads data).
-    fn group_texts(&self, g: usize) -> eyre::Result<Vec<String>>;
+    fn group_texts(&self, g: usize) -> Result<Vec<String>>;
 }
 
 /// A FineWeb-style parquet shard. Construction reads only the footer (column index +
-/// per-group row counts); `group_texts` reopens the file to read a single row group, so
-/// the struct stays `Send + Sync` and holds no live reader. Misses pay one footer read
-/// plus the (cheap) tokenize — never the whole shard in RAM.
+/// row-group count); `group_texts` reopens the file to read a single row group, so the
+/// struct stays `Send + Sync` and holds no live reader. Misses pay one footer read plus
+/// the (cheap) tokenize — never the whole shard in RAM.
 pub struct ParquetShard {
-    path: std::path::PathBuf,
+    path: PathBuf,
     text_idx: usize,
-    rows_per_group: Vec<usize>,
+    num_groups: usize,
 }
 
 impl ParquetShard {
     /// Open a local parquet file and read its metadata.
-    pub fn open(path: std::path::PathBuf) -> eyre::Result<Self> {
-        use parquet::file::reader::{FileReader, SerializedFileReader};
-        let file = std::fs::File::open(&path).wrap_err("opening parquet shard")?;
+    pub fn open(path: PathBuf) -> Result<Self> {
+        let file = File::open(&path).wrap_err("opening parquet shard")?;
         let reader = SerializedFileReader::new(file).wrap_err("opening parquet reader")?;
-        let meta = reader.metadata();
-        let text_idx = meta
-            .file_metadata()
-            .schema_descr()
-            .columns()
-            .iter()
-            .position(|c| c.name() == "text")
-            .ok_or_else(|| eyre::eyre!("parquet shard has no `text` column"))?;
-        let rows_per_group = (0..meta.num_row_groups())
-            .map(|g| meta.row_group(g).num_rows() as usize)
-            .collect();
+        let text_idx = column_index(&reader, "text")?;
+        let num_groups = reader.metadata().num_row_groups();
         Ok(Self {
             path,
             text_idx,
-            rows_per_group,
+            num_groups,
         })
     }
 
     /// Fetch shard `file` from `repo` via the HF cache, then open it.
-    pub fn from_hub(repo: &str, file: &str) -> eyre::Result<Self> {
+    pub fn from_hub(repo: &str, file: &str) -> Result<Self> {
         use hf_hub::api::sync::Api;
         let path = Api::new()?.dataset(repo.to_string()).get(file)?;
         Self::open(path)
@@ -205,22 +266,20 @@ impl ParquetShard {
 }
 
 impl RowGroupSource for ParquetShard {
-    fn group_rows(&self) -> Vec<usize> {
-        self.rows_per_group.clone()
+    fn num_groups(&self) -> usize {
+        self.num_groups
     }
 
-    fn group_texts(&self, g: usize) -> eyre::Result<Vec<String>> {
-        use parquet::file::reader::{FileReader, SerializedFileReader};
-        use parquet::record::RowAccessor;
-        let file = std::fs::File::open(&self.path).wrap_err("opening parquet shard")?;
+    fn group_texts(&self, g: usize) -> Result<Vec<String>> {
+        let file = File::open(&self.path).wrap_err("opening parquet shard")?;
         let reader = SerializedFileReader::new(file).wrap_err("opening parquet reader")?;
-        let row_group = reader.get_row_group(g).wrap_err("reading row group")?;
-        row_group
+        let group = reader.get_row_group(g).wrap_err("reading row group")?;
+        group
             .get_row_iter(None)
             .wrap_err("row iterator")?
-            .map(|record| -> eyre::Result<String> {
-                let row = record.wrap_err("decoding parquet row")?;
-                Ok(row
+            .map(|record| {
+                Ok(record
+                    .wrap_err("decoding parquet row")?
                     .get_string(self.text_idx)
                     .wrap_err("reading text field")?
                     .clone())
@@ -236,13 +295,9 @@ impl RowGroupSource for ParquetShard {
 pub struct StreamingTokenDataset {
     sources: Arc<Vec<Box<dyn RowGroupSource>>>,
     index: Arc<Vec<GroupWindows>>,
-    // Cache holds each group's CONCATENATED token stream (one Vec<u32>), sliced into
-    // windows per `get`. Storing the raw stream (not materialized windows) keeps a
-    // cached group at its natural ~token-count size instead of (windows × seq_len).
     cache: moka::sync::Cache<u64, Arc<Vec<u32>>>,
     tokenizer: Arc<fastokens::Tokenizer>,
     seq_len: usize,
-    /// Global-window sub-range this view exposes as local indices `0..len`.
     offset: usize,
     len: usize,
 }
@@ -257,11 +312,11 @@ impl StreamingTokenDataset {
         tokenizer: Arc<fastokens::Tokenizer>,
         seq_len: usize,
         cache_groups: u64,
-    ) -> eyre::Result<Self> {
+    ) -> Result<Self> {
         // Count pass: tokens per group, one group resident at a time.
         let mut per_source_group_tokens: Vec<Vec<usize>> = Vec::with_capacity(sources.len());
         for src in &sources {
-            let n_groups = src.group_rows().len();
+            let n_groups = src.num_groups();
             let mut counts = Vec::with_capacity(n_groups);
             for g in 0..n_groups {
                 let texts = src.group_texts(g)?;
@@ -291,7 +346,7 @@ impl StreamingTokenDataset {
         files: &[String],
         seq_len: usize,
         cache_groups: u64,
-    ) -> eyre::Result<Self> {
+    ) -> Result<Self> {
         let mut sources: Vec<Box<dyn RowGroupSource>> = Vec::with_capacity(files.len());
         for file in files {
             sources.push(Box::new(ParquetShard::from_hub(repo, file)?));
@@ -317,7 +372,7 @@ impl StreamingTokenDataset {
     }
 
     /// Tokenize + concatenate one row group into its dense token stream (miss path).
-    fn load_group(&self, group_idx: usize) -> eyre::Result<Arc<Vec<u32>>> {
+    fn load_group(&self, group_idx: usize) -> Result<Arc<Vec<u32>>> {
         let gw = self.index[group_idx];
         let texts = self.sources[gw.source].group_texts(gw.group)?;
         let toks = self
@@ -362,13 +417,6 @@ pub struct TokenBatcher {
     pub seq_len: usize,
 }
 
-/// A training batch: `inputs` and next-token `targets`, both `[batch, seq_len]`.
-#[derive(Clone, Debug)]
-pub struct Batch<B: Backend> {
-    pub inputs: Tensor<B, 2, Int>,
-    pub targets: Tensor<B, 2, Int>,
-}
-
 impl<B: Backend> Batcher<B, Vec<i64>, Batch<B>> for TokenBatcher {
     fn batch(&self, items: Vec<Vec<i64>>, device: &B::Device) -> Batch<B> {
         let bsz = items.len();
@@ -381,59 +429,25 @@ impl<B: Backend> Batcher<B, Vec<i64>, Batch<B>> for TokenBatcher {
     }
 }
 
-// --- SFT (instruction tuning) ---
+// ===========================================================================
+// SFT: instruction tuning
+// ===========================================================================
 
 /// Load SFT `(prompt, response)` pairs from the OpenAssistant oasst_top1 parquet
 /// (human-written, Apache-2.0). Each row's `text` is an already-ChatML thread
 /// (`<|im_start|>user…<|im_end|>…<|im_start|>assistant…`); we take the **first**
-/// user→assistant exchange (single-turn is plenty at this scale). Fetched via
-/// HF's auto-parquet (`refs/convert/parquet`, `default/train/0000.parquet`).
-pub fn load_sft_pairs(repo: &str, file: &str, max: usize) -> eyre::Result<Vec<(String, String)>> {
-    use hf_hub::api::sync::Api;
-    use hf_hub::{Repo, RepoType};
-    use parquet::file::reader::{FileReader, SerializedFileReader};
-    use parquet::record::RowAccessor;
-
-    let path = Api::new()?
-        .repo(Repo::with_revision(
-            repo.to_string(),
-            RepoType::Dataset,
-            "refs/convert/parquet".to_string(),
-        ))
-        .get(file)?;
-    let file = std::fs::File::open(&path).wrap_err("opening sft parquet")?;
-    let reader = SerializedFileReader::new(file).wrap_err("opening sft reader")?;
-    let text_idx = reader
-        .metadata()
-        .file_metadata()
-        .schema_descr()
-        .columns()
-        .iter()
-        .position(|c| c.name() == "text")
-        .ok_or_else(|| eyre::eyre!("sft parquet has no `text` column"))?;
-
-    let mut pairs = Vec::new();
-    'outer: for g in 0..reader.num_row_groups() {
-        let row_group = reader.get_row_group(g).wrap_err("reading row group")?;
-        for record in row_group.get_row_iter(None).wrap_err("row iterator")? {
-            let row = record.wrap_err("decoding parquet row")?;
-            let text = match row.get_string(text_idx) {
-                Ok(t) => t,
-                Err(_) => continue,
-            };
-            if let Some(pair) = oasst_first_pair(text) {
-                pairs.push(pair);
-                if pairs.len() >= max {
-                    break 'outer;
-                }
-            }
-        }
-    }
-    Ok(pairs)
+/// user→assistant exchange (single-turn is plenty at this scale).
+pub fn load_sft_pairs(repo: &str, file: &str, max: usize) -> Result<Vec<(String, String)>> {
+    let reader = open_hub_dataset_parquet(repo, file)?;
+    let text = column_index(&reader, "text")?;
+    read_rows(&reader, max, |row| {
+        // A row with no readable text column is skipped, not fatal.
+        Ok(row.get_string(text).ok().and_then(|t| oasst_first_pair(t)))
+    })
 }
 
-/// Extract the first `(user, assistant)` exchange from an oasst_top1 `text`
-/// thread — already ChatML (`<|im_start|>user\n…<|im_end|>…<|im_start|>assistant\n…`).
+/// Extract the first `(user, assistant)` exchange from an oasst_top1 `text` thread —
+/// already ChatML (`<|im_start|>user\n…<|im_end|>…<|im_start|>assistant\n…`).
 fn oasst_first_pair(text: &str) -> Option<(String, String)> {
     let user = chatml_turn(text, "<|im_start|>user\n")?;
     let assistant = chatml_turn(text, "<|im_start|>assistant\n")?;
@@ -448,14 +462,14 @@ fn chatml_turn(text: &str, open: &str) -> Option<String> {
 }
 
 /// Build one padded SFT row `(inputs, targets)` of length `seq_len`: the ChatML
-/// sequence, with prompt and pad target positions set to `IGNORE_ID` so the loss
-/// only sees the assistant response.
+/// sequence, with prompt and pad target positions set to `IGNORE_ID` so the loss only
+/// sees the assistant response.
 pub fn build_sft_row(
     tok: &fastokens::Tokenizer,
     prompt: &str,
     response: &str,
     seq_len: usize,
-) -> eyre::Result<(Vec<i64>, Vec<i64>)> {
+) -> Result<(Vec<i64>, Vec<i64>)> {
     let ignore = crate::chat::IGNORE_ID as i64;
     let full: Vec<i64> = tok
         .encode(&crate::chat::render_full(prompt, response))
@@ -483,8 +497,8 @@ pub fn build_sft_row(
     Ok((inputs, targets))
 }
 
-/// Pre-tokenized SFT rows; the trivial batcher just stacks them (tokenization
-/// happens once up front, so this stays `Send + Sync` for the dataloader).
+/// Pre-tokenized SFT rows; the trivial batcher just stacks them (tokenization happens
+/// once up front, so this stays `Send + Sync` for the dataloader).
 #[derive(Clone)]
 pub struct SftDataset {
     rows: Vec<(Vec<i64>, Vec<i64>)>,
@@ -521,60 +535,36 @@ impl<B: Backend> Batcher<B, (Vec<i64>, Vec<i64>), Batch<B>> for SftBatcher {
     }
 }
 
-// --- DPO (preference optimization) ---
+// ===========================================================================
+// DPO: preference optimization
+// ===========================================================================
 
-/// Load preference triples `(prompt, chosen, rejected)` from a parquet dataset
-/// on the Hub (flat string columns), up to `max`. Read row-group by row-group.
+/// Load preference triples `(prompt, chosen, rejected)` from a parquet dataset on the
+/// Hub (flat string columns), up to `max`.
 pub fn load_dpo_triples(
     repo: &str,
     file: &str,
     max: usize,
-) -> eyre::Result<Vec<(String, String, String)>> {
-    use hf_hub::api::sync::Api;
-    use parquet::file::reader::{FileReader, SerializedFileReader};
-    use parquet::record::RowAccessor;
-
-    let path = Api::new()?
-        .repo(hf_hub::Repo::with_revision(
-            repo.to_string(),
-            hf_hub::RepoType::Dataset,
-            "refs/convert/parquet".to_string(),
-        ))
-        .get(file)?;
-    let file = std::fs::File::open(&path).wrap_err("opening dpo parquet")?;
-    let reader = SerializedFileReader::new(file).wrap_err("opening dpo reader")?;
-
-    let cols = reader.metadata().file_metadata().schema_descr();
-    let col_idx = |name: &str| {
-        cols.columns()
-            .iter()
-            .position(|c| c.name() == name)
-            .ok_or_else(|| eyre::eyre!("dpo parquet missing `{name}` column"))
-    };
-    let (pi, ci, ri) = (col_idx("prompt")?, col_idx("chosen")?, col_idx("rejected")?);
-
-    let mut out = Vec::new();
-    'outer: for g in 0..reader.num_row_groups() {
-        let row_group = reader.get_row_group(g).wrap_err("reading row group")?;
-        for record in row_group.get_row_iter(None).wrap_err("row iterator")? {
-            let row = record.wrap_err("decoding parquet row")?;
-            out.push((
-                row.get_string(pi).wrap_err("prompt field")?.clone(),
-                row.get_string(ci).wrap_err("chosen field")?.clone(),
-                row.get_string(ri).wrap_err("rejected field")?.clone(),
-            ));
-            if out.len() >= max {
-                break 'outer;
-            }
-        }
-    }
-    Ok(out)
+) -> Result<Vec<(String, String, String)>> {
+    let reader = open_hub_dataset_parquet(repo, file)?;
+    let (prompt, chosen, rejected) = (
+        column_index(&reader, "prompt")?,
+        column_index(&reader, "chosen")?,
+        column_index(&reader, "rejected")?,
+    );
+    read_rows(&reader, max, |row| {
+        Ok(Some((
+            row.get_string(prompt).wrap_err("prompt field")?.clone(),
+            row.get_string(chosen).wrap_err("chosen field")?.clone(),
+            row.get_string(rejected).wrap_err("rejected field")?.clone(),
+        )))
+    })
 }
 
-/// One DPO example: response-masked `(input, target)` rows for the chosen and
-/// rejected continuations. The frozen-reference log-probs are computed inline in the
-/// train step (the reference forward is detached), not precomputed — at 1-2 epochs a
-/// cache costs a full upfront reference pass for no saving.
+/// One DPO example: response-masked `(input, target)` rows for the chosen and rejected
+/// continuations. The frozen-reference log-probs are computed inline in the train step,
+/// not precomputed — at 1-2 epochs a cache costs a full upfront reference pass for no
+/// saving.
 #[derive(Clone, Debug)]
 pub struct DpoExample {
     pub chosen: (Vec<i64>, Vec<i64>),
@@ -618,8 +608,11 @@ impl<B: Backend> Batcher<B, DpoExample, DpoBatch<B>> for DpoBatcher {
     fn batch(&self, items: Vec<DpoExample>, device: &B::Device) -> DpoBatch<B> {
         let bsz = items.len();
         let l = items.first().map(|e| e.chosen.0.len()).unwrap_or(0);
-        let col = |f: &dyn Fn(&DpoExample) -> &Vec<i64>| -> Tensor<B, 2, Int> {
-            let flat: Vec<i64> = items.iter().flat_map(|e| f(e).iter().copied()).collect();
+        let col = |select: &dyn Fn(&DpoExample) -> &Vec<i64>| -> Tensor<B, 2, Int> {
+            let flat: Vec<i64> = items
+                .iter()
+                .flat_map(|e| select(e).iter().copied())
+                .collect();
             Tensor::from_data(TensorData::new(flat, [bsz, l]), device)
         };
         DpoBatch {
@@ -631,50 +624,28 @@ impl<B: Backend> Batcher<B, DpoExample, DpoBatch<B>> for DpoBatcher {
     }
 }
 
-// --- GRPO (GSM8K, verifiable reward) ---
+// ===========================================================================
+// GRPO: GSM8K with verifiable reward
+// ===========================================================================
 
-/// Load GSM8K `(question, answer_int)` pairs from the `main` parquet split, up
-/// to `max`. The dataset's `answer` ends with `#### <int>`; we keep that int.
-pub fn load_gsm8k(repo: &str, file: &str, max: usize) -> eyre::Result<Vec<(String, String)>> {
-    use hf_hub::api::sync::Api;
-    use parquet::file::reader::{FileReader, SerializedFileReader};
-    use parquet::record::RowAccessor;
-
-    let path = Api::new()?
-        .repo(hf_hub::Repo::with_revision(
-            repo.to_string(),
-            hf_hub::RepoType::Dataset,
-            "refs/convert/parquet".to_string(),
-        ))
-        .get(file)?;
-    let file = std::fs::File::open(&path).wrap_err("opening gsm8k parquet")?;
-    let reader = SerializedFileReader::new(file).wrap_err("opening gsm8k reader")?;
-
-    let cols = reader.metadata().file_metadata().schema_descr();
-    let col_idx = |name: &str| {
-        cols.columns()
-            .iter()
-            .position(|c| c.name() == name)
-            .ok_or_else(|| eyre::eyre!("gsm8k parquet missing `{name}` column"))
-    };
-    let (qi, ai) = (col_idx("question")?, col_idx("answer")?);
-
-    let mut out = Vec::new();
-    'outer: for g in 0..reader.num_row_groups() {
-        let row_group = reader.get_row_group(g).wrap_err("reading row group")?;
-        for record in row_group.get_row_iter(None).wrap_err("row iterator")? {
-            let row = record.wrap_err("decoding parquet row")?;
-            let question = row.get_string(qi).wrap_err("question field")?.clone();
-            let answer = row.get_string(ai).wrap_err("answer field")?;
-            if let Some(int) = answer.rsplit("####").next() {
-                out.push((question, int.trim().replace(',', "")));
-            }
-            if out.len() >= max {
-                break 'outer;
-            }
-        }
-    }
-    Ok(out)
+/// Load GSM8K `(question, answer_int)` pairs from the `main` parquet split, up to
+/// `max`. The dataset's `answer` ends with `#### <int>`; we keep that int (commas
+/// stripped). `rsplit("####")` always yields at least the whole string, so a row with
+/// no marker keeps the raw trailing text rather than being dropped — matching the
+/// original loader.
+pub fn load_gsm8k(repo: &str, file: &str, max: usize) -> Result<Vec<(String, String)>> {
+    let reader = open_hub_dataset_parquet(repo, file)?;
+    let (question, answer) = (
+        column_index(&reader, "question")?,
+        column_index(&reader, "answer")?,
+    );
+    read_rows(&reader, max, |row| {
+        let q = row.get_string(question).wrap_err("question field")?.clone();
+        let a = row.get_string(answer).wrap_err("answer field")?;
+        Ok(a.rsplit("####")
+            .next()
+            .map(|int| (q, int.trim().replace(',', ""))))
+    })
 }
 
 /// One GRPO example: a tokenized prompt and its verifiable (integer) answer.
@@ -704,9 +675,9 @@ impl Dataset<GrpoExample> for GrpoDataset {
     }
 }
 
-/// A GRPO batch: raw prompts + answers passed through to the training step
-/// (which samples completions and scores them). The tokenizer rides along
-/// (`Arc`, cheap) so the step can decode sampled completions for the reward.
+/// A GRPO batch: raw prompts + answers passed through to the training step (which
+/// samples completions and scores them). The tokenizer rides along (`Arc`, cheap) so
+/// the step can decode sampled completions for the reward.
 #[derive(Clone)]
 pub struct GrpoBatch {
     pub prompts: Vec<Vec<i64>>,
@@ -807,17 +778,16 @@ mod tests {
         assert_eq!(resolve_window(&index, 4), None);
     }
 
-    /// In-memory source: each row group is a list of documents, each a digit string so
-    /// the byte-level tokenizer isn't needed — except `get` does need a real tokenizer,
-    /// so this test uses fixed token strings via a stub that returns them directly.
+    /// In-memory source: each row group is a list of documents. `get` needs a real
+    /// tokenizer, so the streaming test loads the production one.
     struct FakeSource {
         groups: Vec<Vec<String>>,
     }
     impl RowGroupSource for FakeSource {
-        fn group_rows(&self) -> Vec<usize> {
-            self.groups.iter().map(|g| g.len()).collect()
+        fn num_groups(&self) -> usize {
+            self.groups.len()
         }
-        fn group_texts(&self, g: usize) -> eyre::Result<Vec<String>> {
+        fn group_texts(&self, g: usize) -> Result<Vec<String>> {
             Ok(self.groups[g].clone())
         }
     }
