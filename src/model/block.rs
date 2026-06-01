@@ -30,28 +30,48 @@ impl<B: Backend> Layer<B> {
     }
 
     pub fn forward(&self, x: Tensor<B, 3>) -> Tensor<B, 3> {
-        // Pre-norm residual around the Mamba-3 mixer.
-        let x = x
-            .clone()
-            .add(self.mixer.forward(self.mixer_norm.forward(x)));
+        // Pre-norm residual around the Mamba-3 mixer. The freshly computed tensor is the
+        // LHS so Burn can reuse its buffer in-place; the residual clone is on the RHS.
+        let residual = x.clone();
+        let x = self.mixer.forward(self.mixer_norm.forward(x)) + residual;
         // Pre-norm residual around the SwiGLU MLP.
+        let residual = x.clone();
         let ff = self
             .ff_down
-            .forward(self.ff_gate.forward(self.ff_norm.forward(x.clone())));
-        x.add(ff)
+            .forward(self.ff_gate.forward(self.ff_norm.forward(x)));
+        ff + residual
     }
 
     pub fn init_state(&self, batch: usize, device: &B::Device) -> Mamba3State<B> {
         self.mixer.init_state(batch, device)
     }
 
-    /// Pre-norm residual Mamba-3 step and stateless SwiGLU MLP.
-    pub fn step(&self, x: Tensor<B, 3>, state: Mamba3State<B>) -> (Tensor<B, 3>, Mamba3State<B>) {
-        let (mixed, state) = self.mixer.step(self.mixer_norm.forward(x.clone()), state);
-        let x = x.add(mixed);
+    /// Parallel prefill over a full sequence that also returns the mixer's recurrent
+    /// state after the last timestep, so the prompt is consumed in one chunked scan
+    /// instead of `T` serial steps. Output matches [`Layer::forward`]; the state matches
+    /// having called [`Layer::step`] `T` times.
+    pub fn forward_with_state(&self, x: Tensor<B, 3>) -> (Tensor<B, 3>, Mamba3State<B>) {
+        // Pre-norm residual around the Mamba-3 mixer (parallel prefill variant).
+        let residual = x.clone();
+        let (mixed, state) = self.mixer.forward_with_state(self.mixer_norm.forward(x));
+        let x = mixed + residual;
+        // Pre-norm residual around the SwiGLU MLP (stateless).
+        let residual = x.clone();
         let ff = self
             .ff_down
-            .forward(self.ff_gate.forward(self.ff_norm.forward(x.clone())));
-        (x.add(ff), state)
+            .forward(self.ff_gate.forward(self.ff_norm.forward(x)));
+        (ff + residual, state)
+    }
+
+    /// Pre-norm residual Mamba-3 step and stateless SwiGLU MLP.
+    pub fn step(&self, x: Tensor<B, 3>, state: Mamba3State<B>) -> (Tensor<B, 3>, Mamba3State<B>) {
+        let residual = x.clone();
+        let (mixed, state) = self.mixer.step(self.mixer_norm.forward(x), state);
+        let x = mixed + residual;
+        let residual = x.clone();
+        let ff = self
+            .ff_down
+            .forward(self.ff_gate.forward(self.ff_norm.forward(x)));
+        (ff + residual, state)
     }
 }

@@ -103,13 +103,13 @@ impl<B: Backend> Mamba3State<B> {
 
 #[derive(Module, Debug)]
 pub struct Mamba3Block<B: Backend> {
-    in_proj: Linear<B>,           // d_model -> 2*d_inner (x | z)
-    b_proj: Linear<B>,            // d_model -> ngroups*d_state
-    c_proj: Linear<B>,            // d_model -> ngroups*d_state
-    dt_proj: Linear<B>,           // d_model -> nheads   (Δ pre-activation, bias-free)
-    a_proj: Linear<B>,            // d_model -> nheads   (selective A pre-activation)
-    trap_proj: Linear<B>,         // d_model -> nheads   (trapezoidal gate λ)
-    theta_proj: Linear<B>,        // d_model -> num_rope_angles
+    // All seven per-step input projections share the same input `u` and the same fan-in
+    // (d_model), so they are fused into one `d_model -> proj_out` matmul and sliced in
+    // `project` (one GEMM/launch per block instead of seven; KaimingUniform keys off
+    // fan-in, so the fused init is distributionally identical to seven separate ones).
+    // Output layout: [ xz(2·d_inner) | B(ngroups·N) | C(ngroups·N) | Δ(nheads) |
+    //                  A(nheads) | λ(nheads) | θ(num_rope_angles) ].
+    in_proj: Linear<B>,
     out_proj: Linear<B>,          // d_inner -> d_model
     bc_norm: RmsNorm<B>,          // QK-norm on B and C (over d_state)
     dt_bias: Param<Tensor<B, 1>>, // [nheads], inverse-softplus init
@@ -159,14 +159,11 @@ impl<B: Backend> Mamba3Block<B> {
         // dt_bias = dt + log(1 - exp(-dt)) = dt + log(-expm1(-dt)).
         let dt_bias = dt.clone().add(dt.neg().exp().neg().add_scalar(1.0).log());
 
+        // Fused input projection width: xz | B | C | Δ | A | λ | θ.
+        let proj_out = 2 * d_inner + 2 * ngroups * n + 3 * nheads + num_rope_angles;
+
         Self {
-            in_proj: lin(d_model, 2 * d_inner),
-            b_proj: lin(d_model, ngroups * n),
-            c_proj: lin(d_model, ngroups * n),
-            dt_proj: lin(d_model, nheads),
-            a_proj: lin(d_model, nheads),
-            trap_proj: lin(d_model, nheads),
-            theta_proj: lin(d_model, num_rope_angles),
+            in_proj: lin(d_model, proj_out),
             out_proj: lin(d_inner, d_model),
             bc_norm: RmsNormConfig::new(n).init(device),
             dt_bias: Param::from_tensor(dt_bias),
@@ -214,18 +211,36 @@ impl<B: Backend> Mamba3Block<B> {
         let [b, t, _] = u.dims();
         let di = self.d_inner;
         let nh = self.nheads;
+        let n = self.d_state;
+        let gn = self.ngroups * n;
+        let na = self.num_rope_angles;
 
-        // in_proj → split x | z
-        let xz = self.in_proj.forward(u.clone());
+        // Single fused matmul, then slice each segment (all views — grouped before the
+        // compute below). Layout: xz | B | C | Δ | A | λ | θ.
+        let proj = self.in_proj.forward(u); // [B,T,proj_out]
+        let seg = |start: usize, end: usize| proj.clone().slice([0..b, 0..t, start..end]);
+        let two_di = 2 * di;
+        let off_b = two_di;
+        let off_c = off_b + gn;
+        let off_dt = off_c + gn;
+        let off_a = off_dt + nh;
+        let off_trap = off_a + nh;
+        let off_theta = off_trap + nh;
+
+        let xz = seg(0, two_di);
         let x = xz.clone().slice([0..b, 0..t, 0..di]);
-        let z = xz.slice([0..b, 0..t, di..2 * di]);
+        let z = xz.slice([0..b, 0..t, di..two_di]);
+        let b_raw = seg(off_b, off_c);
+        let c_raw = seg(off_c, off_dt);
+        let dt_raw = seg(off_dt, off_a);
+        let a_raw = seg(off_a, off_trap);
+        let trap_raw = seg(off_trap, off_theta);
+        let theta = seg(off_theta, off_theta + na);
 
         // Per-head Δ, A (selective), λ.
         let dt_bias = self.dt_bias.val().reshape([1, 1, nh]);
-        let delta = activation::softplus(self.dt_proj.forward(u.clone()).add(dt_bias), 1.0); // [B,T,nh]
-        let a = activation::softplus(self.a_proj.forward(u.clone()), 1.0)
-            .neg()
-            .clamp_max(-A_FLOOR); // A = -softplus(dd_A) ≤ -A_FLOOR     [B,T,nh]
+        let delta = activation::softplus(dt_raw.add(dt_bias), 1.0); // [B,T,nh]
+        let a = activation::softplus(a_raw, 1.0).neg().clamp_max(-A_FLOOR); // A ≤ -A_FLOOR [B,T,nh]
 
         // Per-step log-decay La = Δ·A ≤ 0 (per head; the chunked segment-sum decay
         // bounds it, so no rate clamp is needed). α = exp(La).
@@ -233,16 +248,14 @@ impl<B: Backend> Mamba3Block<B> {
         let alpha = la.clone().exp();
 
         // λ = σ(trap); β = (1-λ)·Δ·α; γ = λ·Δ — broadcast per head to per channel.
-        let lambda = activation::sigmoid(self.trap_proj.forward(u.clone()));
+        let lambda = activation::sigmoid(trap_raw);
         let one_minus_lambda = lambda.clone().neg().add_scalar(1.0);
         let beta = self.heads_to_channels(one_minus_lambda.mul(delta.clone()).mul(alpha));
         let gamma = self.heads_to_channels(lambda.mul(delta));
 
-        // B_t, C_t = BCNorm(proj(u)) + bias, per group [B,T,ngroups,N].
-        let b_t = self.norm_bc(self.b_proj.forward(u.clone()), self.b_bias.val());
-        let c_t = self.norm_bc(self.c_proj.forward(u.clone()), self.c_bias.val());
-
-        let theta = self.theta_proj.forward(u);
+        // B_t, C_t = BCNorm(slice) + bias, per group [B,T,ngroups,N].
+        let b_t = self.norm_bc(b_raw, self.b_bias.val());
+        let c_t = self.norm_bc(c_raw, self.c_bias.val());
 
         Coeffs {
             x,
@@ -287,6 +300,51 @@ impl<B: Backend> Mamba3Block<B> {
         self.out_proj.forward(gated)
     }
 
+    /// Parallel prefill that also returns the recurrent [`Mamba3State`] left after the
+    /// last timestep, so a prompt can be consumed in one chunked scan (instead of
+    /// `T` serial `step`s) and decoding resumes from the carried state. The `[B,T,d_model]`
+    /// output is identical to [`Mamba3Block::forward`]; the returned state is identical
+    /// (to float precision) to having called `step` `T` times — see
+    /// `forward_with_state_matches_step_carry`.
+    pub fn forward_with_state(&self, u: Tensor<B, 3>) -> (Tensor<B, 3>, Mamba3State<B>) {
+        let co = self.project(u);
+        let (y, h) = self.scan_chunked_carry(&co, crate::config::run().chunk);
+        let y = y.add(self.d_channels().mul(co.x.clone())); // D skip
+        let gated = y.mul(activation::silu(co.z.clone())); // gate by SiLU(z)
+        let out = self.out_proj.forward(gated);
+
+        // The remaining three state fields are last-timestep quantities. They need only
+        // the final token, so derive them from that single column rather than over all T:
+        //   phi    = Σ_t theta  (the cumulative phase at T-1; decode does phi += theta)
+        //   x_prev = x[T-1]
+        //   b_prev = rope(B[T-1], phi)  (rope a single step, not the whole sequence)
+        let [bsz, t_len, di] = co.x.dims();
+        let n = self.d_state;
+        let nh = self.nheads;
+        let na = self.num_rope_angles;
+        let g = self.ngroups;
+        let phi = co.theta.clone().sum_dim(1).reshape([bsz, na]); // Σ theta = cumsum[T-1]
+        let x_prev =
+            co.x.clone()
+                .slice([0..bsz, t_len - 1..t_len, 0..di])
+                .reshape([bsz, di]);
+        // Rope only the last token's B (one [.,.,1,.] rope) instead of all T.
+        let b_last = co.b.clone().slice([0..bsz, t_len - 1..t_len, 0..g, 0..n]); // [B,1,g,N]
+        let b_prev = self
+            .rope_heads(b_last, phi.clone().reshape([bsz, 1, na]))
+            .reshape([bsz, nh, n]); // [B,nh,N]
+
+        (
+            out,
+            Mamba3State {
+                h,
+                phi,
+                x_prev,
+                b_prev,
+            },
+        )
+    }
+
     /// Chunked SSD scan with the run-configured chunk length → `[B, T, d_inner]`.
     fn scan(&self, co: &Coeffs<B>) -> Tensor<B, 3> {
         self.scan_chunked(co, crate::config::run().chunk)
@@ -302,6 +360,12 @@ impl<B: Backend> Mamba3Block<B> {
     /// any drift vs `c` is pure float accumulation in the `[L,L]` score/decay matmuls —
     /// see the `chunk_precision_sweep` test.
     fn scan_chunked(&self, co: &Coeffs<B>, c: usize) -> Tensor<B, 3> {
+        self.scan_chunked_carry(co, c).0
+    }
+
+    /// Same chunked SSD scan as [`scan_chunked`], additionally returning the final
+    /// carried state `h` `[B, d_inner, N]` so a prefill can seed incremental decoding.
+    fn scan_chunked_carry(&self, co: &Coeffs<B>, c: usize) -> (Tensor<B, 3>, Tensor<B, 3>) {
         let c = c.max(1);
         let [bsz, t_len, di] = co.x.dims();
         let n = self.d_state;
@@ -334,7 +398,15 @@ impl<B: Backend> Mamba3Block<B> {
         }); // β·x_{t-1}                                                    [B,T,di]
 
         let mut h = Tensor::<B, 3>::zeros([bsz, di, n], &device); // carried state [B,di,N]
-        let mut ys: Vec<Tensor<B, 3>> = Vec::new();
+        let mut ys: Vec<Tensor<B, 3>> = Vec::with_capacity(t_len.div_ceil(c));
+
+        // Strict-upper (τ<σ) mask, built once at the full chunk width and sliced per chunk.
+        // Every chunk but the last has l == width; the last slices the top-left [l,l]
+        // block, which is exactly that chunk's strict-upper mask.
+        let mask_w = c.min(t_len);
+        let upper_full = Tensor::<B, 2>::ones([mask_w, mask_w], &device)
+            .triu(1)
+            .bool();
 
         let mut t0 = 0;
         while t0 < t_len {
@@ -356,9 +428,9 @@ impl<B: Backend> Mamba3Block<B> {
                 .clone()
                 .unsqueeze_dim::<4>(3)
                 .sub(acs.clone().unsqueeze_dim::<4>(2)); // [B,nh,L,L]: acs[τ]-acs[σ]
-            let upper = Tensor::<B, 2>::ones([l, l], &device)
-                .triu(1) // strict upper τ<σ
-                .bool()
+            let upper = upper_full
+                .clone()
+                .slice([0..l, 0..l])
                 .reshape([1, 1, l, l])
                 .expand([bsz, nh, l, l]);
             let d_mat = diff.mask_fill(upper, f32::NEG_INFINITY).exp(); // [B,nh,L,L] ∈ [0,1]
@@ -406,7 +478,7 @@ impl<B: Backend> Mamba3Block<B> {
             t0 = t1;
         }
 
-        Tensor::cat(ys, 1) // [B, T, d_inner]
+        (Tensor::cat(ys, 1), h) // [B, T, d_inner], final carry [B, d_inner, N]
     }
 
     /// Zeroed recurrent state for incremental generation.
@@ -596,6 +668,69 @@ mod tests {
     #[test]
     fn scan_matches_step() {
         check_scan_matches_step(&small(64));
+    }
+
+    /// `forward_with_state` must return (a) the same output as `forward` and (b) a carry
+    /// state identical to having called `step` `T` times — this is the correctness
+    /// guarantee for parallel prompt prefill. Checks all four state fields, crossing a
+    /// chunk boundary.
+    #[test]
+    fn forward_with_state_matches_step_carry() {
+        let device = Default::default();
+        let cfg = small(64);
+        let block = Mamba3Block::<B>::new(&cfg, &device);
+        let dm = cfg.d_model;
+        let t = 80;
+        let u = Tensor::<B, 3>::random([1, t, dm], burn::tensor::Distribution::Default, &device);
+
+        let (y_par, st_par) = block.forward_with_state(u.clone());
+        let y_ref = block.forward(u.clone());
+
+        // Output parity with the plain parallel forward.
+        let out_diff = (y_par - y_ref)
+            .abs()
+            .max()
+            .into_data()
+            .to_vec::<f32>()
+            .unwrap()[0];
+        assert!(
+            out_diff < 1e-4,
+            "forward_with_state output drifted: {out_diff}"
+        );
+
+        // Carry-state parity with the serial recurrence.
+        let mut state = block.init_state(1, &device);
+        for i in 0..t {
+            let (_, s) = block.step(u.clone().slice([0..1, i..i + 1, 0..dm]), state);
+            state = s;
+        }
+        let field_diff = |a: Tensor<B, 1>, b: Tensor<B, 1>| {
+            (a - b).abs().max().into_data().to_vec::<f32>().unwrap()[0]
+        };
+        let n = cfg.d_state;
+        let di = cfg.d_inner();
+        let nh = di / cfg.headdim;
+        let na = n / 4;
+        let h = field_diff(
+            st_par.h.clone().reshape([di * n]),
+            state.h.clone().reshape([di * n]),
+        );
+        let phi = field_diff(
+            st_par.phi.clone().reshape([na]),
+            state.phi.clone().reshape([na]),
+        );
+        let xp = field_diff(
+            st_par.x_prev.clone().reshape([di]),
+            state.x_prev.clone().reshape([di]),
+        );
+        let bp = field_diff(
+            st_par.b_prev.clone().reshape([nh * n]),
+            state.b_prev.clone().reshape([nh * n]),
+        );
+        assert!(h < 1e-3, "carry h drifted: {h}");
+        assert!(phi < 1e-3, "carry phi drifted: {phi}");
+        assert!(xp < 1e-3, "carry x_prev drifted: {xp}");
+        assert!(bp < 1e-3, "carry b_prev drifted: {bp}");
     }
 
     #[test]

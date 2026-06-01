@@ -36,6 +36,12 @@ pub struct ModelConfig {
     /// context limit.
     #[config(default = 2048)]
     pub max_seq_len: usize,
+    /// Std of the N(0, std) embedding initializer. Burn's Embedding defaults to
+    /// N(0, 1), which — through the tied output head — makes initial logits ~√d_model×
+    /// too large (loss ≈ 82 vs the ln(vocab) ≈ 10.8 a well-scaled LM starts at). 0.02
+    /// is the standard small-init.
+    #[config(default = 0.02)]
+    pub init_std: f64,
 }
 
 impl ModelConfig {

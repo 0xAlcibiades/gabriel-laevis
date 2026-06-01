@@ -2,7 +2,7 @@
 
 use burn::module::Initializer;
 use burn::module::Module;
-use burn::nn::loss::CrossEntropyLossConfig;
+use burn::nn::loss::{CrossEntropyLoss, CrossEntropyLossConfig};
 use burn::nn::{Embedding, EmbeddingConfig, RmsNorm, RmsNormConfig};
 use burn::prelude::*;
 use burn::tensor::Distribution;
@@ -22,24 +22,26 @@ pub struct GabrielLaevis<B: Backend> {
     layers: Vec<Layer<B>>,
     norm: RmsNorm<B>,
     vocab_size: usize,
+    criterion: CrossEntropyLoss<B>,
 }
 
 impl<B: Backend> GabrielLaevis<B> {
     pub fn new(cfg: &ModelConfig, device: &B::Device) -> Self {
         let layers = (0..cfg.n_layers).map(|_| Layer::new(cfg, device)).collect();
         Self {
-            // Burn's Embedding defaults to N(0, 1); tied to the output head that
-            // makes initial logits ~√d_model× too large (loss ≈ 82 vs the ln(vocab)
-            // ≈ 10.8 a well-scaled LM starts at). 0.02 is the standard small-init.
+            // Small-init embedding (see `ModelConfig::init_std`), tied to the output head.
             embed: EmbeddingConfig::new(cfg.vocab_size, cfg.d_model)
                 .with_initializer(Initializer::Normal {
                     mean: 0.0,
-                    std: 0.02,
+                    std: cfg.init_std,
                 })
                 .init(device),
             layers,
             norm: RmsNormConfig::new(cfg.d_model).init(device),
             vocab_size: cfg.vocab_size,
+            criterion: CrossEntropyLossConfig::new()
+                .with_pad_tokens(Some(vec![crate::chat::IGNORE_ID]))
+                .init(device),
         }
     }
 
@@ -70,10 +72,7 @@ impl<B: Backend> GabrielLaevis<B> {
         let v = self.vocab_size;
         let logits = self.forward(batch.inputs).reshape([b * t, v]);
         let targets = batch.targets.reshape([b * t]);
-        let loss = CrossEntropyLossConfig::new()
-            .with_pad_tokens(Some(vec![crate::chat::IGNORE_ID]))
-            .init(&logits.device())
-            .forward(logits.clone(), targets.clone());
+        let loss = self.criterion.forward(logits.clone(), targets.clone());
         ClassificationOutput::new(loss, logits, targets)
     }
 
@@ -97,6 +96,37 @@ impl<B: Backend> GabrielLaevis<B> {
         let w_t = self.embed.weight.val().swap_dims(0, 1);
         let logits = x.reshape([1, dm]).matmul(w_t).reshape([self.vocab_size]);
         (logits, next_states)
+    }
+
+    /// Prime a prompt in a single parallel pass: run all layers' parallel prefill over
+    /// the `[1, T]` prompt, collecting each layer's carried recurrent state, and return
+    /// the next-token logits `[vocab]` alongside the per-layer states ready for decoding.
+    /// Replaces the O(T) token-by-token priming loop (one chunked scan per layer instead
+    /// of `T` serial steps), which is the time-to-first-token win for long prompts. The
+    /// caller guarantees a non-empty prompt.
+    fn prime_prompt(
+        &self,
+        prompt: &[i64],
+        device: &B::Device,
+    ) -> (Tensor<B, 1>, Vec<Mamba3State<B>>) {
+        let t = prompt.len();
+        // Straight from the id slice to the tensor — no intermediate owned Vec.
+        let prompt_ids =
+            Tensor::<B, 1, Int>::from_data(TensorData::from(prompt), device).reshape([1, t]);
+        let mut x = self.embed.forward(prompt_ids); // [1, T, d_model]
+        let mut states = Vec::with_capacity(self.layers.len());
+        for layer in &self.layers {
+            let (xx, st) = layer.forward_with_state(x);
+            x = xx;
+            states.push(st);
+        }
+        let x = self.norm.forward(x); // [1, T, d_model]
+        let dm = x.dims()[2];
+        // Only the last timestep's hidden feeds the next-token logits.
+        let last = x.slice([0..1, t - 1..t, 0..dm]).reshape([1, dm]);
+        let w_t = self.embed.weight.val().swap_dims(0, 1);
+        let logits = last.matmul(w_t).reshape([self.vocab_size]);
+        (logits, states)
     }
 
     /// Batched cached step: `g` tokens `[g]` (Int, on device) + per-layer states for
@@ -152,26 +182,12 @@ impl<B: Backend> GabrielLaevis<B> {
         device: &B::Device,
         mut on_token: F,
     ) -> Result<()> {
-        let mut states: Vec<Mamba3State<B>> = self
-            .layers
-            .iter()
-            .map(|l| l.init_state(1, device))
-            .collect();
-
-        // Prime the prompt: the ids ride on-device as one tensor, sliced one token
-        // at a time to feed the recurrence (no per-token host allocation). An empty
-        // prompt leaves `logits` unset — surfaced as an error, not a panic.
-        let prompt_ids = Tensor::<B, 1, Int>::from_data(
-            TensorData::new(prompt.to_vec(), [prompt.len()]),
-            device,
-        );
-        let mut logits = None;
-        for i in 0..prompt.len() {
-            let (l, s) = self.step_token(prompt_ids.clone().slice(s![i..i + 1]), states);
-            states = s;
-            logits = Some(l);
+        if prompt.is_empty() {
+            return Err(eyre!("prompt must be non-empty"));
         }
-        let mut logits = logits.ok_or_else(|| eyre!("prompt must be non-empty"))?;
+        // Prime the prompt in a single parallel pass (one chunked scan per layer instead
+        // of T serial steps), then decode from the carried per-layer states.
+        let (mut logits, mut states) = self.prime_prompt(prompt, device);
 
         // Per-token generated counts for the penalties, kept on-device as a [vocab]
         // tally — only when a penalty is actually active.
@@ -181,7 +197,7 @@ impl<B: Backend> GabrielLaevis<B> {
         // Seeded host-side sampling noise (reproducible, per-request, independent across
         // concurrent generations) vs the shared device RNG. Only built when sampling.
         let mut rng = match (sampling.temperature > 0.0, sampling.seed) {
-            (true, Some(s)) => Some(SplitMix64(s)),
+            (true, Some(s)) => Some(fastrand::Rng::with_seed(s)),
             _ => None,
         };
 
@@ -189,7 +205,7 @@ impl<B: Backend> GabrielLaevis<B> {
             // The chosen id stays a [1] tensor on-device — straight into the counts
             // tally and the next step. The single host sync is for `on_token`.
             let noise = rng.as_mut().map(|r| {
-                let u: Vec<f32> = (0..vocab).map(|_| r.next_f32()).collect();
+                let u: Vec<f32> = (0..vocab).map(|_| r.f32()).collect();
                 Tensor::<B, 1>::from_data(TensorData::new(u, [vocab]), device)
             });
             let next = sampling.pick(logits, counts.as_ref(), noise);
@@ -232,40 +248,41 @@ impl<B: Backend> GabrielLaevis<B> {
         if prompt.is_empty() {
             return Err(eyre!("prompt must be non-empty"));
         }
-        // Prime the prompt once at batch 1.
-        let mut states: Vec<Mamba3State<B>> = self
-            .layers
-            .iter()
-            .map(|l| l.init_state(1, device))
-            .collect();
-        let prompt_ids = Tensor::<B, 1, Int>::from_data(
-            TensorData::new(prompt.to_vec(), [prompt.len()]),
-            device,
-        );
-        let mut last = None;
-        for i in 0..prompt.len() {
-            let (l, s) = self.step_token(prompt_ids.clone().slice(s![i..i + 1]), states);
-            states = s;
-            last = Some(l);
-        }
-        let logits1 = last.ok_or_else(|| eyre!("prompt must be non-empty"))?; // [vocab]
+        // Prime the prompt once at batch 1, in a single parallel pass.
+        let (logits1, states) = self.prime_prompt(prompt, device); // [vocab], per-layer states
         let vocab = logits1.dims()[0];
 
-        // Fan the primed state + logits out to g rows.
+        // Fan the primed state + logits out to g rows. `expand` broadcasts the single
+        // primed row to `[g, vocab]` as a stride-only view — no host Vec, no `cat` kernel.
         let mut states: Vec<Mamba3State<B>> =
             states.into_iter().map(|st| st.broadcast_batch(g)).collect();
-        let mut logits = Tensor::cat(vec![logits1.reshape([1, vocab]); g], 0); // [g, vocab]
+        let mut logits = logits1.reshape([1, vocab]).expand([g, vocab]); // [g, vocab]
 
-        let mut rng = match (sampling.temperature > 0.0, sampling.seed) {
-            (true, Some(s)) => Some(SplitMix64(s)),
-            _ => None,
-        };
-        let mut out: Vec<Vec<i64>> = vec![Vec::new(); g];
+        // One independent PRNG per row, deterministically forked from the seed. Lets the
+        // per-token noise fill run row-parallel (below) and keeps rows reproducible and
+        // independent. Only built when sampling.
+        let mut row_rngs: Option<Vec<fastrand::Rng>> =
+            match (sampling.temperature > 0.0, sampling.seed) {
+                (true, Some(s)) => {
+                    let mut master = fastrand::Rng::with_seed(s);
+                    Some((0..g).map(|_| master.fork()).collect())
+                }
+                _ => None,
+            };
+        // Output rows pre-sized to their cap; `vec![Vec::new(); g]` would reallocate each
+        // row as it grows, and `vec![Vec::with_capacity(_); g]` clones to len-0 capacity.
+        let mut out: Vec<Vec<i64>> = (0..g).map(|_| Vec::with_capacity(max_new)).collect();
         let mut finished = vec![false; g];
 
         for _ in 0..max_new {
-            let noise = rng.as_mut().map(|r| {
-                let u: Vec<f32> = (0..g * vocab).map(|_| r.next_f32()).collect();
+            // Per-row noise filled in parallel: each thread owns one row's chunk and its
+            // own PRNG, so there's no contention and no single-threaded g·vocab fill.
+            let noise = row_rngs.as_mut().map(|rngs| {
+                use rayon::prelude::*;
+                let mut u = vec![0.0f32; g * vocab];
+                u.par_chunks_mut(vocab)
+                    .zip(rngs.par_iter_mut())
+                    .for_each(|(chunk, r)| chunk.iter_mut().for_each(|slot| *slot = r.f32()));
                 Tensor::<B, 2>::from_data(TensorData::new(u, [g, vocab]), device)
             });
             let ids = sampling.pick_batch(logits, noise); // [g] Int
@@ -302,13 +319,27 @@ pub fn sequence_logprob<B: Backend>(
     targets: Tensor<B, 2, Int>,
 ) -> Tensor<B, 1> {
     let [b, t, v] = logits.dims();
-    let logp = activation::log_softmax(logits, 2); // [B,T,V]
+    // logπ(target) = z_target − logΣexp(z). Compute it directly instead of forming the
+    // dense [B,T,V] `log_softmax` only to `gather` one element per position: gather the
+    // target logit ([B,T]) and subtract a max-shifted (overflow-safe) log-sum-exp over
+    // the vocab ([B,T]). Identical to the log_softmax formulation (see
+    // `sequence_logprob_matches_log_softmax`) but without the extra dense head-sized
+    // activation — a meaningful DPO memory/bandwidth saving on a vocab-heavy head.
     let idx = targets.clone().clamp(0, v as i64 - 1).reshape([b, t, 1]);
-    let chosen = logp.gather(2, idx).reshape([b, t]); // log p(target_t)  [B,T]
+    let chosen = logits.clone().gather(2, idx).reshape([b, t]); // z_target  [B,T]
+    let m = logits.clone().max_dim(2); // [B,T,1] shift for numerical stability
+    let lse = logits
+        .sub(m.clone())
+        .exp()
+        .sum_dim(2)
+        .log()
+        .add(m)
+        .reshape([b, t]); // logΣexp(z)
+    let logp = chosen.sub(lse); // log p(target_t)  [B,T]
     let mask = targets
         .not_equal_elem(crate::chat::IGNORE_ID as i64)
         .float(); // response positions [B,T]
-    chosen.mul(mask).sum_dim(1).reshape([b]) // [B]
+    logp.mul(mask).sum_dim(1).reshape([b]) // [B]
 }
 
 /// Sampling controls. `temperature <= 0` is greedy (`argmax`); otherwise the logits
@@ -347,24 +378,6 @@ impl Default for Sampling {
             stop_token: None,
             seed: None,
         }
-    }
-}
-
-/// Minimal SplitMix64 PRNG — reproducible host-side sampling noise without pulling in
-/// a `rand` dependency. Seeded per request so concurrent generations don't share state.
-struct SplitMix64(u64);
-
-impl SplitMix64 {
-    fn next_u64(&mut self) -> u64 {
-        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        let mut z = self.0;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        z ^ (z >> 31)
-    }
-    /// Uniform in [0, 1) from the top 24 bits.
-    fn next_f32(&mut self) -> f32 {
-        (self.next_u64() >> 40) as f32 / (1u32 << 24) as f32
     }
 }
 
@@ -409,14 +422,18 @@ impl Sampling {
         let l = self.filter(l.div_scalar(self.temperature));
 
         // Gumbel-max: argmax(logits + g) with g = -ln(-ln u), u ~ U(0,1), draws a
-        // categorical sample ∝ softmax(logits) with no explicit softmax or
-        // multinomial. `noise` (seeded host uniforms) is used when supplied, else the
-        // device RNG. u is clamped off {0,1} so g stays finite.
+        // categorical sample ∝ softmax(logits) with no explicit softmax or multinomial.
+        // `noise` (seeded host uniforms) is used when supplied, else the device RNG.
+        //
+        // Upper clamp is 0.99, not 1−1e-7: this runs in the model's native dtype, and in
+        // bf16 the spacing near 1.0 is 2⁻⁸ ≈ 3.9e-3, so anything above ~0.996 rounds to
+        // exactly 1.0 → log(1)=0 → log(0)=−inf → +inf Gumbel → a poisoned argmax. 0.99 is
+        // the largest bound that stays strictly below 1.0 in bf16/f16/f32 alike.
         let u = noise
             .unwrap_or_else(|| {
                 Tensor::<B, 1>::random([vocab], Distribution::Uniform(0.0, 1.0), &device)
             })
-            .clamp(1e-7, 1.0 - 1e-7);
+            .clamp(1e-5, 0.99);
         let gumbel = u.log().neg().log().neg();
         l.add(gumbel).argmax(0)
     }
@@ -437,11 +454,12 @@ impl Sampling {
         }
         let device = logits.device();
         let l = logits.div_scalar(self.temperature);
+        // Upper clamp 0.99 for bf16/f16 safety — see `pick` for the dtype reasoning.
         let u = noise
             .unwrap_or_else(|| {
                 Tensor::<B, 2>::random([g, vocab], Distribution::Uniform(0.0, 1.0), &device)
             })
-            .clamp(1e-7, 1.0 - 1e-7);
+            .clamp(1e-5, 0.99);
         let gumbel = u.log().neg().log().neg();
         l.add(gumbel).argmax(1).reshape([g])
     }
@@ -474,9 +492,15 @@ impl Sampling {
         // exclusive prefix sum `< top_p` keeps the crossing token and always the top
         // one; the cutoff prob is the smallest kept (sorted descending), and any
         // token below it is dropped.
+        //
+        // The descending sort is O(V·log V) and irreducible here: Burn's `topk` is itself
+        // a full `sort_descending` + `select`, so a "truncate-with-topk-first" pass would
+        // be a second sort, not a saving. We do use `sort_descending` (values only) rather
+        // than `sort_descending_with_indices` — the index permutation was computed and
+        // discarded, an extra [vocab] tensor of work per token for nothing.
         if let Some(top_p) = self.top_p {
             let p = activation::softmax(l.clone(), 0);
-            let (sorted, _) = p.clone().sort_descending_with_indices(0);
+            let sorted = p.clone().sort_descending(0);
             let prefix = sorted.clone().cumsum(0).sub(sorted.clone()); // exclusive
             let keep = prefix.lower_elem(top_p);
             let cutoff = sorted.mask_fill(keep.bool_not(), f32::INFINITY).min(); // [1]
@@ -520,6 +544,45 @@ mod tests {
             .with_n_layers(2)
             .with_d_state(32)
             .with_d_ff(128)
+    }
+
+    /// The hand-rolled (gather + max-shifted log-sum-exp) `sequence_logprob` must equal
+    /// the dense `log_softmax(logits).gather(target)` formulation it replaced, including
+    /// the IGNORE_ID masking. This is the correctness guard for the DPO log-likelihoods.
+    #[test]
+    fn sequence_logprob_matches_log_softmax() {
+        let device = Default::default();
+        let (bsz, t, v) = (2usize, 6usize, 17usize);
+        let logits =
+            Tensor::<B, 3>::random([bsz, t, v], burn::tensor::Distribution::Default, &device);
+
+        // Targets in-range, with two IGNORE_ID positions to exercise the mask.
+        let mut tg: Vec<i64> = (0..(bsz * t)).map(|i| (i % v) as i64).collect();
+        tg[0] = crate::chat::IGNORE_ID as i64;
+        tg[t + 1] = crate::chat::IGNORE_ID as i64;
+        let targets = Tensor::<B, 2, Int>::from_data(TensorData::new(tg, [bsz, t]), &device);
+
+        // Reference: the original dense formulation.
+        let logp_dense = activation::log_softmax(logits.clone(), 2);
+        let idx = targets.clone().clamp(0, v as i64 - 1).reshape([bsz, t, 1]);
+        let chosen = logp_dense.gather(2, idx).reshape([bsz, t]);
+        let mask = targets
+            .clone()
+            .not_equal_elem(crate::chat::IGNORE_ID as i64)
+            .float();
+        let reference = chosen.mul(mask).sum_dim(1).reshape([bsz]);
+
+        let got = sequence_logprob(logits, targets);
+        let diff = (got - reference)
+            .abs()
+            .max()
+            .into_data()
+            .to_vec::<f32>()
+            .unwrap()[0];
+        assert!(
+            diff < 1e-5,
+            "sequence_logprob diverged from log_softmax: {diff}"
+        );
     }
 
     #[test]
