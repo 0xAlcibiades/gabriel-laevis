@@ -6,6 +6,14 @@
 /// a no-op for pretraining.
 pub const IGNORE_ID: usize = 0;
 
+/// Token id of the ChatML turn terminator `<|im_end|>`, used as the generation stop
+/// token (so completions end at the turn boundary instead of running to the length
+/// cap). Returns `None` if the tokenizer doesn't map it to a single id.
+pub fn im_end_id(tok: &fastokens::Tokenizer) -> Option<i64> {
+    let ids = tok.encode("<|im_end|>").ok()?;
+    (ids.len() == 1).then(|| ids[0] as i64)
+}
+
 /// Conversation role. `Developer` and `Tool` cover the instruction-hierarchy and
 /// tool-calling conventions; they render as plain ChatML role tags.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
