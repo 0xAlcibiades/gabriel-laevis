@@ -17,7 +17,6 @@ use burn::prelude::*;
 use eyre::{Result, WrapErr};
 use parquet::file::reader::{FileReader, SerializedFileReader};
 use parquet::record::{Row, RowAccessor};
-use rayon::prelude::*;
 
 use crate::config::artifact_dir;
 
@@ -25,62 +24,17 @@ use crate::config::artifact_dir;
 // Tokenizer
 // ===========================================================================
 
-/// Load the byte-level BPE tokenizer, preferring the copy packaged beside the model
-/// in the artifact dir and falling back to fetching `repo` from HF. fastokens 0.2 can
-/// deserialize but not *run* the `Digits` pre-tokenizer, so it is rewritten in memory
-/// to the equivalent `Split` regex, preserving SmolLM2's digit splitting. The
-/// rewritten tokenizer is then written into the artifact dir, so a trained model is
-/// self-contained and later loads work offline.
-pub fn load_tokenizer(repo: &str) -> Result<fastokens::Tokenizer> {
-    use hf_hub::api::sync::Api;
-
-    let packaged = artifact_dir().join("tokenizer.json");
-    let (raw, fetched) = match std::fs::read_to_string(&packaged) {
-        Ok(s) => (s, false),
-        Err(_) => {
-            let path = Api::new()?.model(repo.to_string()).get("tokenizer.json")?;
-            (std::fs::read_to_string(path)?, true)
-        }
-    };
-
-    let mut json: serde_json::Value = serde_json::from_str(&raw)?;
-    rewrite_digits_pretokenizer(&mut json);
-
-    // First fetch: package the rewritten tokenizer beside the model so later loads —
-    // including `serve` — read it locally without hitting HF. Best-effort: a write
-    // failure just means the next load refetches.
-    if fetched && let Ok(s) = serde_json::to_string(&json) {
-        let _ = std::fs::write(&packaged, s);
-    }
-    Ok(fastokens::Tokenizer::from_json(json)?)
-}
-
-/// Rewrite every `Digits` pre-tokenizer to the equivalent `Split` regex, in place.
-/// Idempotent: a packaged copy is already rewritten, so re-running is a no-op.
-fn rewrite_digits_pretokenizer(json: &mut serde_json::Value) {
-    let Some(pretoks) = json
-        .pointer_mut("/pre_tokenizer/pretokenizers")
-        .and_then(|v| v.as_array_mut())
-    else {
-        return;
-    };
-    for p in pretoks.iter_mut() {
-        if p.get("type").and_then(|t| t.as_str()) != Some("Digits") {
-            continue;
-        }
-        // individual_digits → each digit its own pre-token `\d`, else split runs of
-        // digits `\d+`; behavior Isolated keeps them as tokens.
-        let individual = p
-            .get("individual_digits")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(true);
-        *p = serde_json::json!({
-            "type": "Split",
-            "pattern": { "Regex": if individual { r"\d" } else { r"\d+" } },
-            "behavior": "Isolated",
-            "invert": false,
-        });
-    }
+/// Load the byte-level BPE tokenizer trained by `train tokenizer`, read from
+/// `$MODEL_DIR/tokenizer.json`. Errors (rather than fetching anything) if it isn't there
+/// yet — train the tokenizer before any other stage.
+pub fn load_tokenizer() -> Result<fastokens::Tokenizer> {
+    let path = artifact_dir().join("tokenizer.json");
+    fastokens::Tokenizer::from_file(&path).wrap_err_with(|| {
+        format!(
+            "loading tokenizer from {} (run `train tokenizer` first)",
+            path.display()
+        )
+    })
 }
 
 // ===========================================================================
@@ -458,20 +412,6 @@ impl RowGroupSource for SoftwareHeritageSource {
     }
 }
 
-/// Tokenize a row group's documents, **dropping any the frozen-vocab tokenizer can't
-/// encode** (an out-of-vocab byte/char in a doc makes it empty — contributing no tokens —
-/// rather than aborting the whole corpus; FineMath/Stack-Edu carry chars SmolLM2's vocab
-/// lacks). Per-doc `encode` is byte-identical to `encode_batch(_, false)` for encodable
-/// docs (see fastokens' own `encode_batch_matches_sequential`), so the only change vs the
-/// batch call is that a bad doc is skipped. The count pass and the load path both go
-/// through here, so per-group token counts and the materialized stream stay consistent.
-fn encode_group(tokenizer: &fastokens::Tokenizer, texts: &[String]) -> Vec<Vec<u32>> {
-    texts
-        .par_iter()
-        .map(|t| tokenizer.encode(t).unwrap_or_default())
-        .collect()
-}
-
 /// Seekable streaming corpus: dense `seq_len+1` windows packed per row group,
 /// tokenized on demand with a bounded row-group cache. Cheap to clone (everything
 /// shared); a sub-range `view` carves disjoint train/valid splits that share the cache.
@@ -504,7 +444,9 @@ impl StreamingTokenDataset {
             let mut counts = Vec::with_capacity(n_groups);
             for g in 0..n_groups {
                 let texts = src.group_texts(g)?;
-                let toks = encode_group(&tokenizer, &texts);
+                let toks = tokenizer
+                    .encode_batch(&texts, false)
+                    .wrap_err("tokenizing row group (count pass)")?;
                 counts.push(toks.iter().map(|t| t.len()).sum());
             }
             per_source_group_tokens.push(counts);
@@ -565,7 +507,10 @@ impl StreamingTokenDataset {
     fn load_group(&self, group_idx: usize) -> Result<Arc<Vec<u32>>> {
         let gw = self.index[group_idx];
         let texts = self.sources[gw.source].group_texts(gw.group)?;
-        let toks = encode_group(&self.tokenizer, &texts);
+        let toks = self
+            .tokenizer
+            .encode_batch(&texts, false)
+            .wrap_err("tokenizing row group")?;
         let mut stream = Vec::with_capacity(toks.iter().map(|t| t.len()).sum());
         for t in &toks {
             stream.extend_from_slice(t);
@@ -587,11 +532,16 @@ impl Dataset<Vec<i64>> for StreamingTokenDataset {
             .try_get_with(group_idx as u64, || self.load_group(group_idx))
             .map_err(|e| eprintln!("streaming dataset: row group {group_idx} failed: {e}"))
             .ok()?;
-        // Dense window `local`: tokens [local*w .. local*w + w). The window index was
-        // built from this same stream's length, so the slice is always in bounds.
+        // Dense window `local`: tokens [local*w .. local*w + w). The window index is sized
+        // from the count pass; a non-deterministic source can reload a *shorter* stream than
+        // it counted (an SWH blob fetch that succeeded while counting fails on reload → empty
+        // doc → fewer tokens), so a promised window may not fit. Drop it rather than panic,
+        // like the cache-error path above.
         let w = self.seq_len + 1;
         let start = local * w;
-        Some(stream[start..start + w].iter().map(|&t| t as i64).collect())
+        stream
+            .get(start..start + w)
+            .map(|win| win.iter().map(|&t| t as i64).collect())
     }
 
     fn len(&self) -> usize {
@@ -1040,6 +990,14 @@ impl<B: Backend> Batcher<B, GrpoExample, GrpoBatch> for GrpoBatcher {
 mod tests {
     use super::*;
 
+    /// A small committed byte-level BPE for hermetic tests — no network, no training.
+    /// Generated once by `train tokenizer --vocab-size 512` (see `testdata/tokenizer.json`).
+    fn fixture_tokenizer() -> fastokens::Tokenizer {
+        let json = serde_json::from_str(include_str!("../testdata/tokenizer.json"))
+            .expect("fixture tokenizer json");
+        fastokens::Tokenizer::from_json(json).expect("loading fixture tokenizer")
+    }
+
     #[test]
     fn oasst_pair_parses_first_chatml_exchange() {
         let text = "<|im_start|>user\nName 3 dogs<|im_end|>\n<|im_start|>assistant\nRex, Fido, Spot<|im_end|>\n<|im_start|>user\nmore<|im_end|>\n";
@@ -1121,7 +1079,7 @@ mod tests {
         // Real tokenizer so encode_batch matches production; ASCII letters tokenize to
         // stable ids. Two groups of docs; we only assert structural properties (dense,
         // seekable, disjoint views) that hold regardless of the exact ids.
-        let tok = Arc::new(load_tokenizer(crate::constants::TOKENIZER_REPO).unwrap());
+        let tok = Arc::new(fixture_tokenizer());
         let seq_len = 7;
         let w = seq_len + 1;
         // Documents long enough that each group concatenates to several full windows.
@@ -1161,34 +1119,55 @@ mod tests {
     }
 
     #[test]
-    fn streaming_skips_unencodable_documents() {
-        let tok = Arc::new(load_tokenizer(crate::constants::TOKENIZER_REPO).unwrap());
-        // Precondition: the fixture really does contain a byte the frozen vocab can't encode.
-        // Control char 0x06 is one such (FineMath/Stack-Edu carry these; the count pass used
-        // to abort on them — the tokenizer reports it as its byte-char alias 'Ć').
-        assert!(
-            tok.encode("\u{0006}").is_err(),
-            "fixture is not actually unencodable"
-        );
+    fn streaming_tolerates_a_group_that_shrinks_on_reload() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
 
+        // A source whose group yields fewer tokens on reload than during the count pass —
+        // exactly the SoftwareHeritage flaky-fetch case (a fetch that succeeds while counting
+        // fails on reload → empty doc → fewer tokens). The window index is sized from the
+        // count pass, so `get` must not slice past the shortened reloaded stream. Regression:
+        // panic `range start index .. out of range for slice of length ..` at `get`.
+        struct ShrinkingSource {
+            calls: AtomicUsize,
+            long: String,
+            short: String,
+        }
+        impl RowGroupSource for ShrinkingSource {
+            fn num_groups(&self) -> usize {
+                1
+            }
+            fn group_texts(&self, _g: usize) -> Result<Vec<String>> {
+                // First call (the count pass) sees the long doc; every reload sees the short.
+                let n = self.calls.fetch_add(1, Ordering::Relaxed);
+                Ok(vec![if n == 0 {
+                    self.long.clone()
+                } else {
+                    self.short.clone()
+                }])
+            }
+        }
+
+        let tok = Arc::new(fixture_tokenizer());
         let seq_len = 7;
         let para = "the quick brown fox jumps over the lazy dog again and again ";
-        // A group mixing an encodable doc with an unencodable one must build (bad doc
-        // dropped to empty), not error out as `encode_batch` did.
         let ds = StreamingTokenDataset::new(
-            vec![Box::new(FakeSource {
-                groups: vec![vec![para.repeat(4), "bad \u{0006} doc".to_string()]],
+            vec![Box::new(ShrinkingSource {
+                calls: AtomicUsize::new(0),
+                long: para.repeat(8),    // many windows during the count pass
+                short: para.to_string(), // far fewer tokens on reload
             })],
             tok,
             seq_len,
             8,
         )
-        .expect("unencodable doc must be skipped, not fatal");
-        assert!(ds.len() > 0, "encodable content should still yield windows");
-        // Every window is a full, padding-free dense window (the bad doc added nothing).
+        .unwrap();
+
+        // The index promised more windows than the reload can fill. Every `get` must return
+        // a full window or `None` — never panic.
         for i in 0..ds.len() {
-            let win = ds.get(i).expect("in-range window");
-            assert_eq!(win.len(), seq_len + 1);
+            if let Some(win) = ds.get(i) {
+                assert_eq!(win.len(), seq_len + 1, "returned window must be full width");
+            }
         }
     }
 
@@ -1223,7 +1202,7 @@ mod tests {
 
     #[test]
     fn mixture_routes_draws_by_domain_weight() {
-        let tok = Arc::new(load_tokenizer(crate::constants::TOKENIZER_REPO).unwrap());
+        let tok = Arc::new(fixture_tokenizer());
         let seq_len = 7;
         let para = "the quick brown fox jumps over the lazy dog again and again ";
         let web = StreamingTokenDataset::new(

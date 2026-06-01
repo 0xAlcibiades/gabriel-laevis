@@ -1,0 +1,270 @@
+//! Tokenizer training
+//!
+//! Trains a custom BPE tokenizer that is right sized on the actual pretraining dataset.
+//!
+//! Refs:
+//!
+//! - arXiv:1508.07909
+//! - GPT-2 byte-level BPE + regex pre-tokenization (Radford et al. 2019)
+//! - OpenAI tiktoken and Karpathy's nanochat/rustbpe
+//! - SuperBPE arXiv:2503.13423
+//! - SmolLM2 arXiv:2502.02737
+//!
+//! Emits a HuggingFace `tokenizer.json` with `pre_tokenizer = Sequence([Split, ByteLevel])`,
+//! the exact shape `fastokens` fuses into its fast path at inference.
+
+use std::path::{Path, PathBuf};
+
+use eyre::{Result, WrapErr};
+
+use tokenizers::AddedToken;
+use tokenizers::Tokenizer;
+use tokenizers::decoders::byte_level::ByteLevel as ByteLevelDecoder;
+use tokenizers::models::TrainerWrapper;
+use tokenizers::models::bpe::{BPE, BpeTrainer};
+use tokenizers::pre_tokenizers::byte_level::ByteLevel;
+use tokenizers::pre_tokenizers::sequence::Sequence;
+use tokenizers::pre_tokenizers::split::{Split, SplitPattern};
+use tokenizers::tokenizer::SplitDelimiterBehavior;
+
+use crate::config;
+use crate::constants::FINEWEB_REPO;
+use crate::data::{ParquetShard, RowGroupSource, SoftwareHeritageSource};
+
+/// GPT-4 split pattern, with `\p{N}{1,2}` (digit grouping tuned for a small vocab, per
+/// nanochat — `{1,3}` is wasteful in token-space at this scale).
+const SPLIT_PATTERN: &str = r"'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?+\p{L}+|\p{N}{1,2}| ?[^\s\p{L}\p{N}]++[\r\n]*|\s*[\r\n]|\s+(?!\S)|\s+";
+
+/// Reserved special tokens. Order fixes their ids: `<pad>` is first so it lands at
+/// id 0 = `chat::IGNORE_ID`. Most are reserved for capabilities
+/// we'll render later (tool-calling, image/audio/video); only the turn + thinking tokens
+/// are emitted today (see `chat.rs`). Reserving them now is what makes adding those later
+/// not require another from-scratch re-pretrain.
+const SPECIAL_TOKENS: &[&str] = &[
+    // Core (pad must stay first → id 0).
+    "<pad>",
+    "<bos>",
+    "<eos>",
+    // Turns.
+    "<|turn>",
+    "<turn|>",
+    // Reasoning / thinking.
+    "<|think|>",
+    "<|channel>",
+    "<channel|>",
+    // Tool calling.
+    "<|tool>",
+    "<tool|>",
+    "<|tool_call>",
+    "<tool_call|>",
+    "<|tool_response>",
+    "<tool_response|>",
+    // String-value delimiter for structured tool blocks.
+    "<|\"|>",
+    // Multimodal: modality markers + soft-embedding placeholders.
+    "<|image>",
+    "<image|>",
+    "<|audio>",
+    "<audio|>",
+    "<|video>",
+    "<video|>",
+    "<|image|>",
+    "<|audio|>",
+    "<|video|>",
+];
+
+/// Train a byte-level BPE on the pretraining mix and save it as `tokenizer.json`.
+/// `out` defaults to `$MODEL_DIR/tokenizer.json`.
+pub fn run(vocab_size: usize, docs_per_domain: usize, out: Option<PathBuf>) -> Result<()> {
+    let rc = config::run();
+
+    // --- Gather a text sample from the same sources pretraining uses ---
+    let mut texts: Vec<String> = Vec::new();
+
+    println!("sampling web (FineWeb) up to {docs_per_domain} docs...");
+    gather_parquet(
+        &mut texts,
+        FINEWEB_REPO,
+        "main",
+        &rc.shards,
+        "text",
+        docs_per_domain,
+    )?;
+
+    if !rc.math_shards.is_empty() {
+        println!("sampling math up to {docs_per_domain} docs...");
+        gather_parquet(
+            &mut texts,
+            &rc.math_repo,
+            &rc.math_revision,
+            &rc.math_shards,
+            &rc.math_text_column,
+            docs_per_domain,
+        )?;
+    }
+
+    if !rc.code_shards.is_empty() {
+        println!(
+            "sampling code (Stack-Edu via Software Heritage) up to {} files...",
+            rc.code_max_files.min(docs_per_domain)
+        );
+        gather_swh(&mut texts, rc, docs_per_domain)?;
+    }
+
+    println!(
+        "training {vocab_size}-token vocab on {} documents...",
+        texts.len()
+    );
+
+    // --- Configure a GPT-4-style byte-level BPE ---
+    let bpe = BPE::builder()
+        .byte_fallback(true)
+        .build()
+        .map_err(|e| eyre::eyre!("building bpe model: {e}"))?;
+    let mut tokenizer = Tokenizer::new(bpe);
+
+    let split = Split::new(
+        SplitPattern::Regex(SPLIT_PATTERN.to_string()),
+        SplitDelimiterBehavior::Isolated,
+        false,
+    )
+    .map_err(|e| eyre::eyre!("building split pre-tokenizer: {e}"))?;
+    // ByteLevel::new(add_prefix_space, trim_offsets, use_regex). use_regex=false → "bulk"
+    // mode, which fastokens detects to fuse byte-level into BPE.
+    let byte_level = ByteLevel::new(false, true, false);
+    let pre = Sequence::new(vec![split.into(), byte_level.into()]);
+    tokenizer.with_pre_tokenizer(Some(pre));
+    tokenizer.with_decoder(Some(ByteLevelDecoder::default()));
+
+    let bpe_trainer = BpeTrainer::builder()
+        .vocab_size(vocab_size)
+        .min_frequency(0)
+        // `initial_alphabet` wants a std `HashSet`; `ByteLevel::alphabet()` is an ahash set.
+        .initial_alphabet(
+            ByteLevel::alphabet()
+                .into_iter()
+                .collect::<std::collections::HashSet<_>>(),
+        )
+        .special_tokens(
+            SPECIAL_TOKENS
+                .iter()
+                .map(|s| AddedToken::from(*s, true))
+                .collect(),
+        )
+        .build();
+    // `Tokenizer`'s model is `ModelWrapper`, so `train` wants a `TrainerWrapper`.
+    let mut trainer = TrainerWrapper::BpeTrainer(bpe_trainer);
+
+    tokenizer
+        .train(&mut trainer, texts.iter().map(String::as_str))
+        .map_err(|e| eyre::eyre!("training: {e}"))?;
+
+    let out = out.unwrap_or_else(|| config::artifact_dir().join("tokenizer.json"));
+    if let Some(parent) = out.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    tokenizer
+        .save(&out, true)
+        .map_err(|e| eyre::eyre!("saving tokenizer: {e}"))?;
+    println!(
+        "saved {}-token tokenizer to {}",
+        tokenizer.get_vocab_size(true),
+        out.display()
+    );
+
+    verify(&out)?;
+    Ok(())
+}
+
+/// Pull up to `max_docs` documents from `text_column` across `shards` of a HF parquet.
+fn gather_parquet(
+    out: &mut Vec<String>,
+    repo: &str,
+    revision: &str,
+    shards: &[String],
+    text_column: &str,
+    max_docs: usize,
+) -> Result<()> {
+    let mut n = 0;
+    for file in shards {
+        if n >= max_docs {
+            break;
+        }
+        let shard = ParquetShard::from_hub(repo, file, text_column, revision)?;
+        for g in 0..shard.num_groups() {
+            if n >= max_docs {
+                break;
+            }
+            for doc in shard.group_texts(g)? {
+                out.push(doc);
+                n += 1;
+                if n >= max_docs {
+                    break;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Pull code documents (Stack-Edu blobs fetched from Software Heritage).
+fn gather_swh(out: &mut Vec<String>, rc: &config::RunConfig, max_docs: usize) -> Result<()> {
+    let mut n = 0;
+    for file in &rc.code_shards {
+        if n >= max_docs {
+            break;
+        }
+        let src = SoftwareHeritageSource::from_hub(
+            &rc.code_repo,
+            &rc.code_revision,
+            file,
+            &rc.code_blob_column,
+            rc.code_max_files.min(max_docs),
+        )?;
+        for g in 0..src.num_groups() {
+            if n >= max_docs {
+                break;
+            }
+            for doc in src.group_texts(g)? {
+                out.push(doc);
+                n += 1;
+                if n >= max_docs {
+                    break;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Self-check: load the saved tokenizer through the *inference* runtime (fastokens) and
+/// confirm it (a) loads, (b) round-trips, and (c) encodes a control byte the old SmolLM2
+/// vocab choked on (`0x06`) — the regression that motivated this tokenizer training.
+fn verify(path: &Path) -> Result<()> {
+    let tok = fastokens::Tokenizer::from_file(path).wrap_err("fastokens loading the result")?;
+
+    let sample = "fn main() { let x = 2 + 2; }  ∑ café 日本語";
+    let ids = tok.encode(sample).wrap_err("encoding sample")?;
+    let round = tok.decode(&ids, false).wrap_err("decoding sample")?;
+    eyre::ensure!(
+        round == sample,
+        "round-trip mismatch:\n  in:  {sample:?}\n  out: {round:?}"
+    );
+
+    let with_control = "control \u{0006} byte";
+    tok.encode(with_control)
+        .wrap_err("encoding a 0x06 control byte (the SmolLM2 OOV regression)")?;
+
+    // The turn terminator must round-trip to a single id (chat stop token / `turn_end_id`).
+    let turn_end = tok.encode("<turn|>").wrap_err("encoding <turn|>")?;
+    eyre::ensure!(
+        turn_end.len() == 1,
+        "<turn|> must be one special token, got {turn_end:?}"
+    );
+
+    println!(
+        "verified via fastokens: round-trips, encodes 0x06, sample -> {} tokens",
+        ids.len()
+    );
+    Ok(())
+}

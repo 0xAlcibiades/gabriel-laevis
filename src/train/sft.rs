@@ -36,19 +36,11 @@ pub fn run(
 
     let pairs = load_sft_pairs(SFT_REPO, SFT_FILE, max_examples)?;
 
-    // Tokenize + mask in one pass, dropping rows the frozen-vocab tokenizer can't encode
-    // (a handful of OASST rows carry bytes with no base token, e.g. control char 0x06)
-    // rather than aborting the run.
-    let total = pairs.len();
-
+    // Tokenize + response-mask each pair.
     let rows: Vec<_> = pairs
         .iter()
-        .filter_map(|(p, r)| build_sft_row(&ctx.tokenizer, p, r, SFT_SEQ_LEN).ok())
-        .collect();
-
-    if rows.len() < total {
-        println!("skipped {} unencodable rows", total - rows.len());
-    }
+        .map(|(p, r)| build_sft_row(&ctx.tokenizer, p, r, SFT_SEQ_LEN))
+        .collect::<Result<_>>()?;
 
     let (rows, valid_rows) = split_valid(rows, VALID_ROWS);
 

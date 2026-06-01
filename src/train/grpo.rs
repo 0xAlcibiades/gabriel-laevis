@@ -31,7 +31,7 @@ use eyre::{Result, WrapErr};
 use crate::config::ModelConfig;
 use crate::constants::{
     GRPO_COMPLETION_LEN, GRPO_GROUP_SIZE, GRPO_KL_BETA, GRPO_PROMPT_LEN, GSM8K_FILE, GSM8K_REPO,
-    NUM_WORKERS, SHUFFLE_SEED, TOKENIZER_REPO,
+    NUM_WORKERS, SHUFFLE_SEED,
 };
 use crate::data::{
     GrpoBatch, GrpoBatcher, GrpoDataset, GrpoExample, load_gsm8k, load_tokenizer, split_valid,
@@ -93,7 +93,7 @@ fn sample_all<G: Backend>(
 ) -> (Vec<Vec<Vec<i64>>>, Vec<Vec<f32>>) {
     let sampling = Sampling {
         temperature: TEMPERATURE,
-        stop_token: crate::chat::im_end_id(&batch.tokenizer),
+        stop_token: crate::chat::turn_end_id(&batch.tokenizer),
         ..Default::default()
     };
 
@@ -283,7 +283,7 @@ impl<B: Backend> InferenceStep for GrpoModel<B> {
         let device = self.policy.device();
         let (_comps, rewards) = sample_all(&self.policy, &batch, &device);
         let greedy = Sampling {
-            stop_token: crate::chat::im_end_id(&batch.tokenizer),
+            stop_token: crate::chat::turn_end_id(&batch.tokenizer),
             ..Sampling::greedy()
         };
         let (mut pass1, mut pass_k) = (0usize, 0usize);
@@ -352,32 +352,25 @@ pub fn run(
     println!("loading {GSM8K_REPO} (up to {max_examples} prompts)...");
     let pairs = load_gsm8k(GSM8K_REPO, GSM8K_FILE, max_examples).wrap_err("loading gsm8k")?;
 
-    // Skip prompts with bytes the frozen-vocab tokenizer can't encode (rare in GSM8K,
-    // but cheap to be safe) instead of aborting the stage.
-    let total = pairs.len();
     let examples: Vec<GrpoExample> = pairs
         .into_iter()
-        .filter_map(|(q, answer)| {
+        .map(|(q, answer)| {
             let prompt: Vec<i64> = ctx
                 .tokenizer
                 .encode(&crate::chat::render_prompt(&q))
-                .ok()?
+                .wrap_err("encoding gsm8k prompt")?
                 .into_iter()
                 .take(GRPO_PROMPT_LEN) // truncate to the prompt budget as we collect
                 .map(|x| x as i64)
                 .collect();
-            Some(GrpoExample { prompt, answer })
+            Ok(GrpoExample { prompt, answer })
         })
-        .collect();
-
-    if examples.len() < total {
-        println!("skipped {} unencodable prompts", total - examples.len());
-    }
+        .collect::<Result<_>>()?;
 
     let (examples, valid_examples) = split_valid(examples, VALID_PROMPTS);
 
     // Owned tokenizer for the batcher (re-loaded from cache; avoids needing Clone).
-    let tokenizer = std::sync::Arc::new(load_tokenizer(TOKENIZER_REPO).wrap_err("load tokenizer")?);
+    let tokenizer = std::sync::Arc::new(load_tokenizer().wrap_err("load tokenizer")?);
     let batcher = GrpoBatcher { tokenizer };
 
     // Slice into shared 1000-step checkpoint-epochs with auto-resume (see dpo/pretrain).

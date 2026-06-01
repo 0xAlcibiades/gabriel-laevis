@@ -41,7 +41,7 @@ the defaults. This file is the working notes; see References for the overview an
     GET (fetched in parallel), so `GL_CODE_MAX_FILES` caps how many blobs a shard
     contributes (default 4096) to bound startup fetch cost; raise it on a fast link.
 - `MODEL_DIR` holds checkpoints + token caches (default `/tmp/gabriel-laevis`); `HF_HOME`
-  holds dataset/tokenizer downloads.
+  holds dataset downloads.
 
 ## Conventions
 

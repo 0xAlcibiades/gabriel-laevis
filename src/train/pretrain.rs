@@ -11,7 +11,7 @@ use burn::train::metric::{LossMetric, PerplexityMetric};
 use burn::train::{Learner, SupervisedTraining};
 use eyre::Result;
 
-use crate::constants::{FINEWEB_REPO, NUM_WORKERS, SHUFFLE_SEED, TOKENIZER_REPO};
+use crate::constants::{FINEWEB_REPO, NUM_WORKERS, SHUFFLE_SEED};
 use crate::data::{
     MixSchedule, MixtureDataset, SoftwareHeritageSource, StreamingTokenDataset, TokenBatcher,
     load_tokenizer,
@@ -47,7 +47,7 @@ pub fn run(
     // access, never held whole in RAM (viable for 5B+ tokens). An owned Arc tokenizer
     // is needed because the dataset must be Send+Sync across dataloader workers.
     println!("indexing FineWeb-Edu shards...");
-    let tokenizer = std::sync::Arc::new(load_tokenizer(TOKENIZER_REPO)?);
+    let tokenizer = std::sync::Arc::new(load_tokenizer()?);
 
     let corpus = StreamingTokenDataset::from_hub(
         tokenizer.clone(),

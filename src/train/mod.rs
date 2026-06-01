@@ -5,6 +5,7 @@ pub mod dpo;
 pub mod grpo;
 pub mod pretrain;
 pub mod sft;
+pub mod tokenizer;
 
 pub use context::TrainingContext;
 

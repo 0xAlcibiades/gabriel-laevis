@@ -26,8 +26,7 @@ impl TrainingContext {
         std::fs::create_dir_all(&artifact)
             .wrap_err_with(|| format!("creating artifact dir {}", artifact.display()))?;
 
-        let tokenizer = crate::data::load_tokenizer(crate::constants::TOKENIZER_REPO)
-            .wrap_err("loading tokenizer")?;
+        let tokenizer = crate::data::load_tokenizer().wrap_err("loading tokenizer")?;
 
         Ok(Self {
             device: Default::default(),

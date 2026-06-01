@@ -172,23 +172,15 @@ pub fn run(
         load_dpo_triples(DPO_REPO, DPO_FILE, max_examples).wrap_err("loading dpo data")?;
     println!("tokenizing + scoring {} preference pairs...", triples.len());
 
-    let total = triples.len();
-
-    // Build chosen+rejected together per triple into one DpoExample, dropping the whole
-    // triple if either side has a byte the frozen-vocab tokenizer can't encode — so the
-    // two sides stay paired, and unencodable data is skipped instead of aborting.
+    // Build chosen + rejected response-masked rows together per triple.
     let examples: Vec<DpoExample> = triples
         .into_iter()
-        .filter_map(|(p, c, r)| {
-            let chosen = build_sft_row(&ctx.tokenizer, &p, &c, DPO_SEQ_LEN).ok()?;
-            let rejected = build_sft_row(&ctx.tokenizer, &p, &r, DPO_SEQ_LEN).ok()?;
-            Some(DpoExample { chosen, rejected })
+        .map(|(p, c, r)| {
+            let chosen = build_sft_row(&ctx.tokenizer, &p, &c, DPO_SEQ_LEN)?;
+            let rejected = build_sft_row(&ctx.tokenizer, &p, &r, DPO_SEQ_LEN)?;
+            Ok(DpoExample { chosen, rejected })
         })
-        .collect();
-
-    if examples.len() < total {
-        println!("skipped {} unencodable pairs", total - examples.len());
-    }
+        .collect::<Result<_>>()?;
 
     let (examples, valid_examples) = split_valid(examples, VALID_EXAMPLES);
 

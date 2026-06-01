@@ -11,7 +11,7 @@ A **Mamba-3** small language model implemented from scratch in [Burn](https://bu
 
 - **Framework:** Burn 0.21
 - **Backend:** cubecl depending on environment
-- **Tokenizer:** fastokens with byte-level BPE
+- **Tokenizer:** fastokens with byte-level BPE a la [nanochat](https://github.com/karpathy/nanochat)
 - **Architecture:** [Mamba-3](https://arxiv.org/abs/2603.15569) (SISO) — Llama-style backbone; each block pairs a Mamba-3 mixer ([SSD](https://arxiv.org/abs/2405.21060) scan, half-[RoPE](https://arxiv.org/abs/2104.09864)) with a [SwiGLU](https://arxiv.org/abs/2002.05202) MLP, pre-norm [RMSNorm](https://arxiv.org/abs/1910.07467), tied embeddings.
 
 ## Status
@@ -67,7 +67,7 @@ MIT
 
 **Models & data**
 
-- [SmolLM2](https://huggingface.co/HuggingFaceTB/SmolLM2-135M) — tokenizer and small-LM training reference.
+- [SmolLM2](https://huggingface.co/HuggingFaceTB/SmolLM2-135M) — small-LM training reference.
 - [FineWeb-Edu](https://huggingface.co/datasets/HuggingFaceFW/fineweb-edu) — web pretraining corpus.
 - [FineMath](https://huggingface.co/datasets/HuggingFaceTB/finemath) — math/reasoning pretraining corpus.
 - [Stack-Edu](https://huggingface.co/datasets/HuggingFaceTB/stack-edu) — code pretraining corpus.

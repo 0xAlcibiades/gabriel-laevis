@@ -1,5 +1,7 @@
 //! Training entrypoint. One stage per invocation. Run `train --help` for usage.
 
+use std::path::PathBuf;
+
 use clap::{Parser, Subcommand};
 use eyre::Result;
 
@@ -15,6 +17,19 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Stage {
+    /// Stage 0: train the byte-level BPE tokenizer on the pretraining mix. Run before
+    /// `pretrain`; it writes the `tokenizer.json` every later stage loads.
+    Tokenizer {
+        /// Target vocabulary size (256 base bytes + special tokens included).
+        #[arg(long, default_value_t = 16_384)]
+        vocab_size: usize,
+        /// Max documents sampled per domain (web / math / code).
+        #[arg(long, default_value_t = 50_000)]
+        docs_per_domain: usize,
+        /// Output path. Default: `$MODEL_DIR/tokenizer.json`.
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
     /// Pretrain on with next-token cross-entropy.
     Pretrain {
         /// Corpus budget in tokens, not context length.
@@ -64,8 +79,8 @@ enum Stage {
         #[arg(long)]
         from: Option<String>,
     },
-    /// Run all four stages in order: pretrain, sft, dpo, grpo. Each stage's size is
-    /// independently overridable; defaults match running the stages individually.
+    /// Run all stages in order: tokenizer, pretrain, sft, dpo, grpo. Each stage's size
+    /// is independently overridable; defaults match running the stages individually.
     All {
         /// Pretrain corpus budget in tokens.
         #[arg(default_value_t = 1_000_000)]
@@ -97,9 +112,21 @@ enum Stage {
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
+    // The tokenizer stage *creates* the tokenizer, so it runs before `TrainingContext`
+    // (which loads one).
+    if let Stage::Tokenizer {
+        vocab_size,
+        docs_per_domain,
+        out,
+    } = &cli.stage
+    {
+        return gabriel_laevis_0::train::tokenizer::run(*vocab_size, *docs_per_domain, out.clone());
+    }
+
     let ctx = TrainingContext::new()?;
 
     match cli.stage {
+        Stage::Tokenizer { .. } => unreachable!("handled before context creation"),
         Stage::Pretrain {
             max_tokens,
             epochs,

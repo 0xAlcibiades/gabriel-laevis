@@ -19,7 +19,6 @@ use serde_json::json;
 
 use gabriel_laevis_0::Compute;
 use gabriel_laevis_0::config::{ModelConfig, artifact_dir};
-use gabriel_laevis_0::constants::TOKENIZER_REPO;
 use gabriel_laevis_0::data::load_tokenizer;
 use gabriel_laevis_0::model::GabrielLaevis;
 use gabriel_laevis_0::model::lm::Sampling;
@@ -47,7 +46,6 @@ struct AppState {
     model: GabrielLaevis<Compute>,
     tokenizer: Arc<fastokens::Tokenizer>,
     device: Device,
-    /// `<|im_end|>` id, used to stop generation at the ChatML turn boundary.
     stop_token: Option<i64>,
 }
 
@@ -76,7 +74,6 @@ struct ChatRequest {
     frequency_penalty: Option<f32>,
     #[serde(default)]
     presence_penalty: Option<f32>,
-    /// Per-request sampling seed (reproducible host-side Gumbel noise).
     #[serde(default)]
     seed: Option<u64>,
     #[serde(default)]
@@ -102,7 +99,6 @@ struct CompletionRequest {
     frequency_penalty: Option<f32>,
     #[serde(default)]
     presence_penalty: Option<f32>,
-    /// Per-request sampling seed (reproducible host-side Gumbel noise).
     #[serde(default)]
     seed: Option<u64>,
     #[serde(default)]
@@ -117,8 +113,8 @@ async fn main() -> Result<()> {
 
     let artifact = artifact_dir();
 
-    let tokenizer = Arc::new(load_tokenizer(TOKENIZER_REPO).wrap_err("loading tokenizer")?);
-    let stop_token = gabriel_laevis_0::chat::im_end_id(tokenizer.as_ref());
+    let tokenizer = Arc::new(load_tokenizer().wrap_err("loading tokenizer")?);
+    let stop_token = gabriel_laevis_0::chat::turn_end_id(tokenizer.as_ref());
 
     let cfg = ModelConfig::load(artifact.join("config.json")).wrap_err("loading config")?;
     cfg.validate()?;
@@ -153,9 +149,7 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// Spawn blocking generation, streaming token ids over a kanal channel — sync
-/// sender on the blocking thread, async receiver for the handler. Concurrent
-/// requests run concurrently (no lock; see `AppState`).
+/// Spawn blocking generation, streaming token ids over a kanal channel
 fn token_channel(
     state: Arc<AppState>,
     prompt_ids: Vec<i64>,

@@ -1,8 +1,5 @@
 //! External data sources and run-wide defaults.
 
-/// Byte-level BPE tokenizer.
-pub const TOKENIZER_REPO: &str = "HuggingFaceTB/SmolLM2-135M";
-
 /// Pretraining corpus (web).
 pub const FINEWEB_REPO: &str = "HuggingFaceFW/fineweb-edu";
 pub const FINEWEB_SHARD: &str = "sample/10BT/000_00000.parquet";
