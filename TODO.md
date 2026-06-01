@@ -14,7 +14,7 @@ Backlog. Items are actionable; in-code debt uses the markers
       autodiff `Backward` (Burn's `OpsPrep`/`OpsKind`, as `linear`/`embedding` do) that runs
       the same kernel shape in reverse. `scan_matches_step`, 
       `forward_with_state_matches_step_carry`, and `chunk_precision_sweep` already 
-      gate any kernel against it.
+      pin scan output to the serial `step` recurrence — they gate the kernel as-is.
 - [ ] **Fused cross-entropy kernel.** Compute the loss and its gradients straight from
       `hidden` and the tied embedding `W`, never materializing the `[B,T,vocab]` logits
       or their gradient (cut-cross-entropy). Caps the dominant head-memory term and removes
