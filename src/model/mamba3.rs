@@ -397,88 +397,114 @@ impl<B: Backend> Mamba3Block<B> {
             )
         }); // β·x_{t-1}                                                    [B,T,di]
 
-        let mut h = Tensor::<B, 3>::zeros([bsz, di, n], &device); // carried state [B,di,N]
-        let mut ys: Vec<Tensor<B, 3>> = Vec::with_capacity(t_len.div_ceil(c));
+        // Pad the time axis up to a whole number `nc` of chunks. Padded positions carry
+        // gx=bx=la=0, so they contribute nothing to any real output or carried state — the
+        // exclusive-causal mask only reads σ ≤ τ (all real for a real τ; padding is at the
+        // tail of the last chunk), and the padded outputs are sliced off at the end.
+        let nc = t_len.div_ceil(c);
+        let t2 = nc * c;
+        let pad = t2 - t_len;
+        let la_h = co.la.clone().swap_dims(1, 2); // [B,nh,T]
+        let (b_rot, c_rot, b_prev, gx, bx, la_h) = if pad > 0 {
+            (
+                Tensor::cat(vec![b_rot, Tensor::zeros([bsz, nh, pad, n], &device)], 2),
+                Tensor::cat(vec![c_rot, Tensor::zeros([bsz, nh, pad, n], &device)], 2),
+                Tensor::cat(vec![b_prev, Tensor::zeros([bsz, nh, pad, n], &device)], 2),
+                Tensor::cat(vec![gx, Tensor::zeros([bsz, pad, di], &device)], 1),
+                Tensor::cat(vec![bx, Tensor::zeros([bsz, pad, di], &device)], 1),
+                Tensor::cat(vec![la_h, Tensor::zeros([bsz, nh, pad], &device)], 2),
+            )
+        } else {
+            (b_rot, c_rot, b_prev, gx, bx, la_h)
+        };
 
-        // Strict-upper (τ<σ) mask, built once at the full chunk width and sliced per chunk.
-        // Every chunk but the last has l == width; the last slices the top-left [l,l]
-        // block, which is exactly that chunk's strict-upper mask.
-        let mask_w = c.min(t_len);
-        let upper_full = Tensor::<B, 2>::ones([mask_w, mask_w], &device)
+        // Flatten (B, nh, nc) into one batch dim `g` so the per-chunk work becomes a stack
+        // of plain 3-D batched matmuls (one GEMM per op for the whole sequence, not per chunk).
+        let g = bsz * nh * nc;
+        let crot = c_rot.reshape([g, c, n]); // [G,L,N]
+        let brot = b_rot.reshape([g, c, n]);
+        let bprev = b_prev.reshape([g, c, n]);
+        // [B,T,di] → per-head, chunked [B,nh,nc,L,hp] → [G,L,hp].
+        let to_heads = |v: Tensor<B, 3>| {
+            v.reshape([bsz, nc, c, nh, hp])
+                .permute([0, 3, 1, 2, 4])
+                .reshape([g, c, hp])
+        };
+        let gx_c = to_heads(gx); // [G,L,hp]
+        let bx_c = to_heads(bx);
+
+        // Per-chunk cumulative log-decay and the segment-sum decay D[τ,σ] for all chunks at
+        // once (overflow-free: mask the strict-upper τ<σ to −inf before the exp).
+        let acs = la_h.reshape([g, c]).cumsum(1); // [G,L]
+        let diff = acs
+            .clone()
+            .unsqueeze_dim::<3>(2)
+            .sub(acs.clone().unsqueeze_dim::<3>(1)); // [G,L,L]: acs[τ]-acs[σ]
+        let upper = Tensor::<B, 2>::ones([c, c], &device)
             .triu(1)
-            .bool();
+            .bool()
+            .reshape([1, c, c])
+            .expand([g, c, c]);
+        let d_mat = diff.mask_fill(upper, f32::NEG_INFINITY).exp(); // [G,L,L] ∈ [0,1]
 
-        let mut t0 = 0;
-        while t0 < t_len {
-            let l = (t_len - t0).min(c);
-            let t1 = t0 + l;
-            // [B,nh,T,*] → chunk [B,nh,L,*]
-            let slh = |x: &Tensor<B, 4>, w: usize| x.clone().slice([0..bsz, 0..nh, t0..t1, 0..w]);
-            // [B,T,di] → per-head chunk [B,nh,L,hp]
-            let vheads = |v: Tensor<B, 3>| {
-                v.slice([0..bsz, t0..t1, 0..di])
-                    .reshape([bsz, l, nh, hp])
-                    .swap_dims(1, 2)
-            };
+        // Intra-chunk: (C·Bᵀ ∘ D)·V for the current (γx, B) and previous (βx₋₁, B₋₁) terms.
+        let score_cur = crot
+            .clone()
+            .matmul(brot.clone().swap_dims(1, 2))
+            .mul(d_mat.clone());
+        let score_prev = crot
+            .clone()
+            .matmul(bprev.clone().swap_dims(1, 2))
+            .mul(d_mat);
+        let y_intra = score_cur
+            .matmul(gx_c.clone())
+            .add(score_prev.matmul(bx_c.clone())); // [G,L,hp]
 
-            // Per-head cumulative log-decay and segment-sum decay D[h,τ,σ].
-            let la_c = co.la.clone().slice([0..bsz, t0..t1, 0..nh]).swap_dims(1, 2); // [B,nh,L]
-            let acs = la_c.cumsum(2); // [B,nh,L]
-            let diff = acs
+        // Each chunk's end-state contribution: Σ_σ exp(La_last − La_σ)·V_σ⊗B_σ, all chunks at
+        // once. exp(La_last) is the per-chunk decay applied to the state entering that chunk.
+        let la_last = acs.clone().slice([0..g, c - 1..c]); // [G,1]
+        let decay = la_last.clone().sub(acs.clone()).exp().unsqueeze_dim::<3>(2); // [G,L,1] ∈(0,1]
+        let g_end = decay.clone().mul(gx_c).swap_dims(1, 2); // [G,hp,L]
+        let b_end = decay.mul(bx_c).swap_dims(1, 2);
+        let contrib = g_end
+            .matmul(brot)
+            .add(b_end.matmul(bprev))
+            .reshape([bsz, nh, nc, hp, n]); // [B,nh,nc,hp,N]
+        let e_last = la_last.exp().reshape([bsz, nh, nc, 1, 1]);
+
+        // Inter-chunk recurrence over the `nc` chunk-states — the only sequential part, but
+        // each step is a cheap elementwise state update (no [L,L] matmuls). `h_ins[i]` is the
+        // state entering chunk i; the state after the last chunk is the carry-out.
+        let mut h = Tensor::<B, 4>::zeros([bsz, nh, hp, n], &device);
+        let mut h_ins: Vec<Tensor<B, 4>> = Vec::with_capacity(nc);
+        for i in 0..nc {
+            h_ins.push(h.clone());
+            let e_i = e_last
                 .clone()
-                .unsqueeze_dim::<4>(3)
-                .sub(acs.clone().unsqueeze_dim::<4>(2)); // [B,nh,L,L]: acs[τ]-acs[σ]
-            let upper = upper_full
+                .slice([0..bsz, 0..nh, i..i + 1, 0..1, 0..1])
+                .reshape([bsz, nh, 1, 1]);
+            let c_i = contrib
                 .clone()
-                .slice([0..l, 0..l])
-                .reshape([1, 1, l, l])
-                .expand([bsz, nh, l, l]);
-            let d_mat = diff.mask_fill(upper, f32::NEG_INFINITY).exp(); // [B,nh,L,L] ∈ [0,1]
-
-            // Per-head C·Bᵀ scores, decay-weighted.
-            let crot = slh(&c_rot, n); // [B,nh,L,N]
-            let brot = slh(&b_rot, n);
-            let bprev = slh(&b_prev, n);
-            let s_cur = crot.clone().matmul(brot.clone().swap_dims(2, 3)); // [B,nh,L,L]
-            let s_prev = crot.clone().matmul(bprev.clone().swap_dims(2, 3));
-            let score_cur = s_cur.mul(d_mat.clone());
-            let score_prev = s_prev.mul(d_mat);
-
-            // Intra-chunk: (C·Bᵀ ∘ D)·V for the current and previous terms.
-            let gx_c = vheads(gx.clone()); // [B,nh,L,hp]
-            let bx_c = vheads(bx.clone());
-            let y_intra = score_cur
-                .matmul(gx_c.clone())
-                .add(score_prev.matmul(bx_c.clone())); // [B,nh,L,hp]
-
-            // Inter-chunk: carried state read out, decayed by exp(La_τ).
-            let h_heads = h.clone().reshape([bsz, nh, hp, n]); // [B,nh,hp,N]
-            let ch = crot.matmul(h_heads.swap_dims(2, 3)); // [B,nh,L,hp]
-            let y_inter = acs.clone().exp().unsqueeze_dim::<4>(3).mul(ch); // [B,nh,L,hp]
-
-            let y_chunk = y_intra.add(y_inter).swap_dims(1, 2).reshape([bsz, l, di]);
-            ys.push(y_chunk);
-
-            // State carry: h_end = exp(La_last)·h + Σ_σ exp(La_last−La_σ)·V_σ⊗B_σ.
-            let la_last = acs.clone().slice([0..bsz, 0..nh, l - 1..l]); // [B,nh,1]
-            let decay = la_last.clone().sub(acs).exp().unsqueeze_dim::<4>(3); // [B,nh,L,1] ∈(0,1]
-            let g_end = decay.clone().mul(gx_c).swap_dims(2, 3); // [B,nh,hp,L]
-            let b_end = decay.mul(bx_c).swap_dims(2, 3);
-            let contrib = g_end
-                .matmul(brot) // [B,nh,hp,L]·[B,nh,L,N] → [B,nh,hp,N]
-                .add(b_end.matmul(bprev))
-                .reshape([bsz, di, n]);
-            let e_last = la_last
-                .exp()
-                .reshape([bsz, nh, 1, 1])
-                .expand([bsz, nh, hp, 1])
-                .reshape([bsz, di, 1]); // exp(La_last) per channel [B,di,1]
-            h = e_last.mul(h).add(contrib);
-
-            t0 = t1;
+                .slice([0..bsz, 0..nh, i..i + 1, 0..hp, 0..n])
+                .reshape([bsz, nh, hp, n]);
+            h = e_i.mul(h).add(c_i);
         }
+        let final_h = h.reshape([bsz, di, n]);
 
-        (Tensor::cat(ys, 1), h) // [B, T, d_inner], final carry [B, d_inner, N]
+        // Inter-chunk output: read each chunk's entering state through C, decayed by exp(La_τ).
+        let h_in = Tensor::stack::<5>(h_ins, 2).reshape([g, hp, n]); // [B,nh,nc,hp,N] → [G,hp,N]
+        let ch = crot.matmul(h_in.swap_dims(1, 2)); // [G,L,hp]
+        let y_inter = acs.exp().unsqueeze_dim::<3>(2).mul(ch); // [G,L,hp]
+
+        // Recombine diagonal + off-diagonal terms, restore [B,T,d_inner], strip padding.
+        let y = y_intra
+            .add(y_inter)
+            .reshape([bsz, nh, nc, c, hp])
+            .permute([0, 2, 3, 1, 4]) // [B,nc,L,nh,hp]
+            .reshape([bsz, t2, di])
+            .slice([0..bsz, 0..t_len, 0..di]);
+
+        (y, final_h) // [B, T, d_inner], final carry [B, d_inner, N]
     }
 
     /// Zeroed recurrent state for incremental generation.
