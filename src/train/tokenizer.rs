@@ -14,11 +14,13 @@
 //! Emits a HuggingFace `tokenizer.json` with `pre_tokenizer = Sequence([Split, ByteLevel])`,
 //! the exact shape `fastokens` fuses into its fast path at inference.
 
+use crate::chat::SpecialToken;
 use crate::config;
 use crate::constants::FINEWEB_REPO;
 use crate::data::{ParquetShard, RowGroupSource, SoftwareHeritageSource};
 use eyre::{Result, WrapErr};
 use std::path::{Path, PathBuf};
+use strum::IntoEnumIterator;
 use tokenizers::AddedToken;
 use tokenizers::Tokenizer;
 use tokenizers::decoders::byte_level::ByteLevel as ByteLevelDecoder;
@@ -32,42 +34,6 @@ use tokenizers::tokenizer::SplitDelimiterBehavior;
 /// GPT-4 like split pattern, with `\p{N}{1,2}` with digit grouping tuned for a small vocab,
 /// per nanochat — `{1,3}` would be wasteful in token-space at smaller scales.
 const SPLIT_PATTERN: &str = r"'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?+\p{L}+|\p{N}{1,2}| ?[^\s\p{L}\p{N}]++[\r\n]*|\s*[\r\n]|\s+(?!\S)|\s+";
-
-/// Reserved special tokens.
-const SPECIAL_TOKENS: &[&str] = &[
-    // Core
-    //
-    // <pad> must stay first so it lands at id 0 = `chat::IGNORE_ID`.
-    "<pad>",
-    "<bos>",
-    "<eos>",
-    // Turns.
-    "<|turn>",
-    "<turn|>",
-    // Reasoning and thinking.
-    "<|think|>",
-    "<|channel>",
-    "<channel|>",
-    // Tool calling.
-    "<|tool>",
-    "<tool|>",
-    "<|tool_call>",
-    "<tool_call|>",
-    "<|tool_response>",
-    "<tool_response|>",
-    // String-value delimiter for structured tool blocks.
-    "<|\"|>",
-    // Multimodal: modality markers + soft-embedding placeholders.
-    "<|image>",
-    "<image|>",
-    "<|audio>",
-    "<audio|>",
-    "<|video>",
-    "<video|>",
-    "<|image|>",
-    "<|audio|>",
-    "<|video|>",
-];
 
 /// Train a byte-level BPE on the pretraining mix and save it as `tokenizer.json`.
 ///
@@ -145,9 +111,8 @@ pub fn run(vocab_size: usize, docs_per_domain: usize, out: Option<PathBuf>) -> R
                 .collect::<std::collections::HashSet<_>>(),
         )
         .special_tokens(
-            SPECIAL_TOKENS
-                .iter()
-                .map(|s| AddedToken::from(*s, true))
+            SpecialToken::iter()
+                .map(|t| AddedToken::from(t.as_str(), true))
                 .collect(),
         )
         .build();
@@ -257,11 +222,14 @@ fn verify(path: &Path) -> Result<()> {
     tok.encode(with_control)
         .wrap_err("encoding a 0x06 control byte (the SmolLM2 OOV regression)")?;
 
-    // The turn terminator must round-trip to a single id (chat stop token / `turn_end_id`).
-    let turn_end = tok.encode("<turn|>").wrap_err("encoding <turn|>")?;
+    // The turn terminator must encode to its known id (the chat stop token).
+    let turn_end = tok
+        .encode(SpecialToken::TurnClose.as_str())
+        .wrap_err("encoding <turn|>")?;
     eyre::ensure!(
-        turn_end.len() == 1,
-        "<turn|> must be one special token, got {turn_end:?}"
+        turn_end == [crate::chat::TURN_END_ID as u32],
+        "<turn|> must encode to the single id {} (chat::TURN_END_ID), got {turn_end:?}",
+        crate::chat::TURN_END_ID,
     );
 
     println!(

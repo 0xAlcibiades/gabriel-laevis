@@ -112,7 +112,7 @@ async fn main() -> Result<()> {
     let artifact = artifact_dir();
 
     let tokenizer = Arc::new(load_tokenizer().wrap_err("loading tokenizer")?);
-    let stop_token = gabriel_laevis_0::chat::turn_end_id(tokenizer.as_ref());
+    let stop_token = Some(gabriel_laevis_0::chat::TURN_END_ID);
 
     let cfg = ModelConfig::load(artifact.join("config.json")).wrap_err("loading config")?;
     cfg.validate()?;

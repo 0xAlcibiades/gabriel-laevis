@@ -88,7 +88,7 @@ fn sample_all<G: Backend>(
 ) -> (Vec<Vec<Vec<i64>>>, Vec<Vec<f32>>) {
     let sampling = Sampling {
         temperature: TEMPERATURE,
-        stop_token: crate::chat::turn_end_id(&batch.tokenizer),
+        stop_token: Some(crate::chat::TURN_END_ID),
         ..Default::default()
     };
 
@@ -266,7 +266,7 @@ impl<B: Backend> InferenceStep for GrpoModel<B> {
         let device = self.policy.device();
         let (_comps, rewards) = sample_all(&self.policy, &batch, &device);
         let greedy = Sampling {
-            stop_token: crate::chat::turn_end_id(&batch.tokenizer),
+            stop_token: Some(crate::chat::TURN_END_ID),
             ..Sampling::greedy()
         };
         let (mut pass1, mut pass_k) = (0usize, 0usize);

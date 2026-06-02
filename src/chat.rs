@@ -11,20 +11,77 @@
 //! The tokenizer reserves the full modern control-token set (tool-calling, image/audio/video);
 //! only the text + thinking path is rendered here. This needs an update accordingly.
 
-/// `<pad>` is a reserved special token with id 0, so it never appears as a real target.
-pub const IGNORE_ID: usize = 0;
-
-/// Token id of the turn terminator `<turn|>`, used as the generation stop token.
-///
-/// Returns `None` if the tokenizer doesn't map it to a single id.
-///
-/// TODO:
-/// However, it is a known ID by construction, so we should choose here instead
-/// the known numeric id from tokenizer.rs
-pub fn turn_end_id(tok: &fastokens::Tokenizer) -> Option<i64> {
-    let ids = tok.encode("<turn|>").ok()?;
-    (ids.len() == 1).then(|| ids[0] as i64)
+/// The reserved special-token vocabulary, in id order. `train::tokenizer` reserves these in
+/// exactly this declaration order, so each variant's discriminant *is* its vocab id. One
+/// enum shared by tokenizer training, the id constants below, and rendering — so they can't
+/// drift apart.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, strum::EnumIter)]
+pub enum SpecialToken {
+    Pad,
+    Bos,
+    Eos,
+    TurnOpen,
+    TurnClose,
+    Think,
+    ChannelOpen,
+    ChannelClose,
+    ToolOpen,
+    ToolClose,
+    ToolCallOpen,
+    ToolCallClose,
+    ToolResponseOpen,
+    ToolResponseClose,
+    StringDelim,
+    ImageOpen,
+    ImageClose,
+    AudioOpen,
+    AudioClose,
+    VideoOpen,
+    VideoClose,
+    Image,
+    Audio,
+    Video,
 }
+
+impl SpecialToken {
+    /// The literal token string the tokenizer reserves and `render` emits.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Pad => "<pad>",
+            Self::Bos => "<bos>",
+            Self::Eos => "<eos>",
+            Self::TurnOpen => "<|turn>",
+            Self::TurnClose => "<turn|>",
+            Self::Think => "<|think|>",
+            Self::ChannelOpen => "<|channel>",
+            Self::ChannelClose => "<channel|>",
+            Self::ToolOpen => "<|tool>",
+            Self::ToolClose => "<tool|>",
+            Self::ToolCallOpen => "<|tool_call>",
+            Self::ToolCallClose => "<tool_call|>",
+            Self::ToolResponseOpen => "<|tool_response>",
+            Self::ToolResponseClose => "<tool_response|>",
+            Self::StringDelim => "<|\"|>",
+            Self::ImageOpen => "<|image>",
+            Self::ImageClose => "<image|>",
+            Self::AudioOpen => "<|audio>",
+            Self::AudioClose => "<audio|>",
+            Self::VideoOpen => "<|video>",
+            Self::VideoClose => "<video|>",
+            Self::Image => "<|image|>",
+            Self::Audio => "<|audio|>",
+            Self::Video => "<|video|>",
+        }
+    }
+}
+
+/// Loss-ignore / pad target id. `<pad>` is id 0, so it never appears as a real target: the
+/// cross-entropy loss drops it (`with_pad_tokens`), masking prompt and padding.
+pub const IGNORE_ID: usize = SpecialToken::Pad as usize;
+
+/// Turn terminator `<turn|>`, used as the generation stop token (completions end at the turn
+/// boundary, not the length cap). Known by construction from [`SpecialToken`].
+pub const TURN_END_ID: i64 = SpecialToken::TurnClose as i64;
 
 /// Conversation role.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -99,22 +156,27 @@ pub fn render(messages: &[Message], add_generation_prompt: bool) -> String {
     let mut out = String::with_capacity(est_len);
 
     for m in messages {
-        out.push_str("<|turn>");
+        out.push_str(SpecialToken::TurnOpen.as_str());
         out.push_str(m.role.tag());
         out.push('\n');
 
         if let Some(ref t) = m.thinking {
-            out.push_str("<|channel>thought\n");
+            out.push_str(SpecialToken::ChannelOpen.as_str());
+            out.push_str("thought\n");
             out.push_str(t);
-            out.push_str("\n<channel|>");
+            out.push('\n');
+            out.push_str(SpecialToken::ChannelClose.as_str());
         }
 
         out.push_str(&m.content);
-        out.push_str("<turn|>\n");
+        out.push_str(SpecialToken::TurnClose.as_str());
+        out.push('\n');
     }
 
     if add_generation_prompt {
-        out.push_str("<|turn>model\n");
+        out.push_str(SpecialToken::TurnOpen.as_str());
+        out.push_str(Role::Model.tag());
+        out.push('\n');
     }
     out
 }
