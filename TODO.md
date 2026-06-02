@@ -83,6 +83,14 @@ Backlog. Items are actionable; in-code debt uses the markers
       sampling — the model can produce them (`forward` logits / `sequence_logprob`), the
       server just doesn't expose them. Add `logprobs`/`echo`, then point the harness at the
       endpoint.
+- [ ] **Bits-per-byte training metric.** Report bpb live in the Learner TUI next to loss —
+      the vocab-invariant unit (`bpb = Σ token-NLL / (ln2 · Σ token-byte-lengths)`), so a run
+      is comparable across vocab sizes and against the byte-level fork. Per-token perplexity
+      is not: it's `2^(bpb · bytes_per_token)`, silently rescaling with the tokenizer (ppl
+      103 here is ~1.7 bpb). Needs a `[vocab]` token→byte-length table (decode each id, count
+      UTF-8 bytes; special tokens are 0 and masked out, as are `IGNORE_ID` targets), then a
+      metric that sum-reduces NLL and bytes separately and divides — distinct from the eval
+      harness above, this is the live training readout. Ref: nanochat/DCLM `loss_eval` bpb.
 - [ ] **TinyGSM-style math.** The proven small-model GSM8K path (not GRPO): synthetic
       code-solution SFT data + code-execution reward + a verifier model (gen + token
       head, best-of-N). Scaling the verifier beats scaling the generator.

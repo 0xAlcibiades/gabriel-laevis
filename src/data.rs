@@ -18,9 +18,8 @@ use crate::config::artifact_dir;
 // Tokenizer
 // ===========================================================================
 
-/// Load tokenizer
-///
-/// TODO: Dry this and don't duplicate the same function everywhere.
+/// Load the byte-level BPE tokenizer from `$MODEL_DIR/tokenizer.json` (run `train tokenizer`
+/// first — this errors rather than fetching anything).
 pub fn load_tokenizer() -> Result<fastokens::Tokenizer> {
     let path = artifact_dir().join("tokenizer.json");
     fastokens::Tokenizer::from_file(&path).wrap_err_with(|| {
@@ -742,56 +741,74 @@ impl<B: Backend> Batcher<B, Vec<i64>, Batch<B>> for TokenBatcher {
 // SFT: instruction tuning
 // ===========================================================================
 
-/// Load SFT `(prompt, response)` pairs from the OpenAssistant oasst_top1 parquet. Each
-/// row's `text` is an already-ChatML thread (`<|im_start|>user…<|im_end|>…<|im_start|>assistant…`);i
-///
-/// TODO: Adapt pairs to our chat tags and load all pairs that would fit within the sequence.
-pub fn load_sft_pairs(repo: &str, file: &str, max: usize) -> Result<Vec<(String, String)>> {
+/// Load OpenAssistant oasst_top1 conversations, up to `max` threads. Each row's `text` is
+/// an already-ChatML thread (`<|im_start|>{role}\n…<|im_end|>`, the dataset's own format,
+/// parsed as-is); rendering into our template happens in [`build_sft_rows`].
+pub fn load_sft_threads(
+    repo: &str,
+    file: &str,
+    max: usize,
+) -> Result<Vec<Vec<crate::chat::Message>>> {
     let reader = open_hub_dataset_parquet(repo, file)?;
     let text = column_index(&reader, "text")?;
     read_rows(&reader, max, |row| {
         // A row with no readable text column is skipped, not fatal.
-        Ok(row.get_string(text).ok().and_then(|t| oasst_first_pair(t)))
+        Ok(row
+            .get_string(text)
+            .ok()
+            .map(|t| oasst_thread(t))
+            .filter(|turns| !turns.is_empty()))
     })
 }
 
-/// Extract the first `(user, assistant)` exchange from an oasst_top1 `text` thread —
-/// already ChatML (`<|im_start|>user\n…<|im_end|>…<|im_start|>assistant\n…`).
-///
-/// TODO: Adapt pairs to our chat tags and load all pairs that would fit within the sequence.
-fn oasst_first_pair(text: &str) -> Option<(String, String)> {
-    let user = chatml_turn(text, "<|im_start|>user\n")?;
-    let assistant = chatml_turn(text, "<|im_start|>assistant\n")?;
-    (!user.is_empty() && !assistant.is_empty()).then_some((user, assistant))
+/// Parse an oasst_top1 `text` thread into ordered turns. The dataset delimits turns with
+/// `<|im_start|>{role}\n…<|im_end|>`; we map `user`/`assistant`/`system` to roles and drop
+/// empty or unknown-role turns.
+fn oasst_thread(text: &str) -> Vec<crate::chat::Message> {
+    use crate::chat::Message;
+    let mut turns = Vec::new();
+    let mut rest = text;
+    while let Some(open) = rest.find("<|im_start|>") {
+        let after = &rest[open + "<|im_start|>".len()..];
+        let Some(nl) = after.find('\n') else { break };
+        let role = after[..nl].trim();
+        let body = &after[nl + 1..];
+        let end = body.find("<|im_end|>").unwrap_or(body.len());
+        let content = body[..end].trim().to_string();
+        if !content.is_empty() {
+            match role {
+                "user" => turns.push(Message::user(content)),
+                "assistant" => turns.push(Message::assistant(content)),
+                "system" => turns.push(Message::system(content)),
+                _ => {}
+            }
+        }
+        rest = &body[end..];
+    }
+    turns
 }
 
-// TODO: Adapt to our chat template.
-
-/// Content of the first turn opened by `open`, up to its `<|im_end|>`.
-fn chatml_turn(text: &str, open: &str) -> Option<String> {
-    let rest = &text[text.find(open)? + open.len()..];
-    let end = rest.find("<|im_end|>").unwrap_or(rest.len());
-    Some(rest[..end].trim().to_string())
-}
-
-/// Build one padded SFT row `(inputs, targets)` of length `seq_len`: the ChatML
-/// sequence, with prompt and pad target positions set to `IGNORE_ID` so the loss only
-/// sees the assistant response.
-pub fn build_sft_row(
+/// Build a padded `(inputs, targets)` row of length `seq_len` that trains only on
+/// `response`: the conversation `history` plus the open model turn is the `IGNORE_ID`-masked
+/// prefix, and the response with its closing `<turn|>` are the supervised targets.
+/// `render(history, true)` is a token prefix of the full render, which the masking relies on.
+fn build_masked_row(
     tok: &fastokens::Tokenizer,
-    prompt: &str,
+    history: &[crate::chat::Message],
     response: &str,
     seq_len: usize,
 ) -> Result<(Vec<i64>, Vec<i64>)> {
     let ignore = crate::chat::IGNORE_ID as i64;
+    let mut convo = history.to_vec();
+    convo.push(crate::chat::Message::assistant(response));
     let full: Vec<i64> = tok
-        .encode(&crate::chat::render_full(prompt, response))
+        .encode(&crate::chat::render(&convo, false))
         .wrap_err("encoding sft example")?
         .into_iter()
         .map(|x| x as i64)
         .collect();
     let prompt_len = tok
-        .encode(&crate::chat::render_prompt(prompt))
+        .encode(&crate::chat::render(history, true))
         .wrap_err("encoding sft prompt")?
         .len();
 
@@ -808,6 +825,38 @@ pub fn build_sft_row(
         };
     }
     Ok((inputs, targets))
+}
+
+/// Build one padded row from a single-turn `(prompt, response)`. Used by DPO; a thin wrapper
+/// over [`build_masked_row`] with a one-message user history.
+pub fn build_sft_row(
+    tok: &fastokens::Tokenizer,
+    prompt: &str,
+    response: &str,
+    seq_len: usize,
+) -> Result<(Vec<i64>, Vec<i64>)> {
+    build_masked_row(
+        tok,
+        &[crate::chat::Message::user(prompt)],
+        response,
+        seq_len,
+    )
+}
+
+/// Build SFT rows from a full conversation: one cumulative-context row per model turn, so
+/// every assistant response in the thread is trained on with all of its prior context.
+pub fn build_sft_rows(
+    tok: &fastokens::Tokenizer,
+    conv: &[crate::chat::Message],
+    seq_len: usize,
+) -> Result<Vec<(Vec<i64>, Vec<i64>)>> {
+    let mut rows = Vec::new();
+    for (i, m) in conv.iter().enumerate() {
+        if m.role == crate::chat::Role::Model && !m.content.is_empty() {
+            rows.push(build_masked_row(tok, &conv[..i], &m.content, seq_len)?);
+        }
+    }
+    Ok(rows)
 }
 
 /// Pre-tokenized SFT rows.
@@ -1033,13 +1082,28 @@ mod tests {
     }
 
     #[test]
-    fn oasst_pair_parses_first_chatml_exchange() {
+    fn oasst_thread_parses_all_turns() {
+        use crate::chat::Role;
         let text = "<|im_start|>user\nName 3 dogs<|im_end|>\n<|im_start|>assistant\nRex, Fido, Spot<|im_end|>\n<|im_start|>user\nmore<|im_end|>\n";
+        let turns = oasst_thread(text);
         assert_eq!(
-            oasst_first_pair(text),
-            Some(("Name 3 dogs".to_string(), "Rex, Fido, Spot".to_string()))
+            turns.len(),
+            3,
+            "all three turns parsed, not just the first pair"
         );
-        assert_eq!(oasst_first_pair("no markers here"), None);
+        assert_eq!(
+            (turns[0].role, turns[0].content.as_str()),
+            (Role::User, "Name 3 dogs")
+        );
+        assert_eq!(
+            (turns[1].role, turns[1].content.as_str()),
+            (Role::Model, "Rex, Fido, Spot")
+        );
+        assert_eq!(
+            (turns[2].role, turns[2].content.as_str()),
+            (Role::User, "more")
+        );
+        assert!(oasst_thread("no markers here").is_empty());
     }
 
     #[test]

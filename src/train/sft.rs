@@ -5,7 +5,7 @@
 
 use crate::config::ModelConfig;
 use crate::constants::{NUM_WORKERS, SFT_FILE, SFT_REPO, SFT_SEQ_LEN, SHUFFLE_SEED};
-use crate::data::{SftBatcher, SftDataset, build_sft_row, load_sft_pairs, split_valid};
+use crate::data::{SftBatcher, SftDataset, build_sft_rows, load_sft_threads, split_valid};
 use crate::train::TrainingContext;
 use burn::config::Config;
 use burn::data::dataloader::DataLoaderBuilder;
@@ -35,13 +35,13 @@ pub fn run(
 
     println!("loading {SFT_REPO} (up to {max_examples} examples)...");
 
-    let pairs = load_sft_pairs(SFT_REPO, SFT_FILE, max_examples)?;
+    let threads = load_sft_threads(SFT_REPO, SFT_FILE, max_examples)?;
 
-    // Tokenize and response-mask each pair.
-    let rows: Vec<_> = pairs
-        .iter()
-        .map(|(p, r)| build_sft_row(&ctx.tokenizer, p, r, SFT_SEQ_LEN))
-        .collect::<Result<_>>()?;
+    // Render each thread into our template; one response-masked row per model turn.
+    let mut rows = Vec::new();
+    for conv in &threads {
+        rows.extend(build_sft_rows(&ctx.tokenizer, conv, SFT_SEQ_LEN)?);
+    }
 
     let (rows, valid_rows) = split_valid(rows, VALID_ROWS);
 
