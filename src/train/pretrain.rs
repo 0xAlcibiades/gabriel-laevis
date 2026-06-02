@@ -2,8 +2,7 @@
 
 use crate::constants::{FINEWEB_REPO, NUM_WORKERS, SHUFFLE_SEED};
 use crate::data::{
-    MixSchedule, MixtureDataset, SoftwareHeritageSource, StreamingTokenDataset, TokenBatcher,
-    load_tokenizer,
+    MixSchedule, MixtureDataset, StreamingTokenDataset, TokenBatcher, load_tokenizer, swh_sources,
 };
 use crate::train::TrainingContext;
 use burn::config::Config;
@@ -123,17 +122,13 @@ pub fn run(
             rc.code_shards.len(),
             rc.code_max_files
         );
-        let mut sources: Vec<Box<dyn crate::data::RowGroupSource>> =
-            Vec::with_capacity(rc.code_shards.len());
-        for file in &rc.code_shards {
-            sources.push(Box::new(SoftwareHeritageSource::from_hub(
-                &rc.code_repo,
-                &rc.code_revision,
-                file,
-                &rc.code_blob_column,
-                rc.code_max_files,
-            )?));
-        }
+        let sources = swh_sources(
+            &rc.code_repo,
+            &rc.code_revision,
+            &rc.code_shards,
+            &rc.code_blob_column,
+            rc.code_max_files,
+        )?;
         domains.push(StreamingTokenDataset::new(
             sources,
             tokenizer.clone(),

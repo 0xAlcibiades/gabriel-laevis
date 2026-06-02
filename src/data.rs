@@ -409,6 +409,66 @@ pub struct StreamingTokenDataset {
     len: usize,
 }
 
+/// Build parquet-shard sources for `files` from `repo`@`revision`, reading `text_column`.
+pub fn parquet_sources(
+    repo: &str,
+    revision: &str,
+    files: &[String],
+    text_column: &str,
+) -> Result<Vec<Box<dyn RowGroupSource>>> {
+    files
+        .iter()
+        .map(|f| {
+            Ok(
+                Box::new(ParquetShard::from_hub(repo, f, text_column, revision)?)
+                    as Box<dyn RowGroupSource>,
+            )
+        })
+        .collect()
+}
+
+/// Build Software-Heritage code sources for `files` from `repo`@`revision`.
+pub fn swh_sources(
+    repo: &str,
+    revision: &str,
+    files: &[String],
+    blob_column: &str,
+    max_files: usize,
+) -> Result<Vec<Box<dyn RowGroupSource>>> {
+    files
+        .iter()
+        .map(|f| {
+            Ok(Box::new(SoftwareHeritageSource::from_hub(
+                repo,
+                revision,
+                f,
+                blob_column,
+                max_files,
+            )?) as Box<dyn RowGroupSource>)
+        })
+        .collect()
+}
+
+/// Pull up to `max_docs` documents across `sources`, in order — the tokenizer-training
+/// sampler. (Pretraining instead wraps the same sources in a `StreamingTokenDataset`.)
+pub fn collect_docs(sources: &[Box<dyn RowGroupSource>], max_docs: usize) -> Result<Vec<String>> {
+    let mut out = Vec::new();
+    'outer: for src in sources {
+        for g in 0..src.num_groups() {
+            if out.len() >= max_docs {
+                break 'outer;
+            }
+            for doc in src.group_texts(g)? {
+                out.push(doc);
+                if out.len() >= max_docs {
+                    break 'outer;
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
 impl StreamingTokenDataset {
     /// Build from already-opened sources. Runs a streaming count pass (tokenize each
     /// group, keep only its token count, discard tokens) to size the dense window index.
@@ -446,10 +506,8 @@ impl StreamingTokenDataset {
         })
     }
 
-    /// Fetches and open the listed shards from `repo` at git `revision` to
-    /// build the dataset.
-    ///
-    /// TODO: DRY this with the N other implementations
+    /// Fetch + open the listed parquet shards from `repo`@`revision` (reading `text_column`)
+    /// and build the dataset.
     pub fn from_hub(
         tokenizer: Arc<fastokens::Tokenizer>,
         repo: &str,
@@ -459,16 +517,12 @@ impl StreamingTokenDataset {
         seq_len: usize,
         cache_groups: u64,
     ) -> Result<Self> {
-        let mut sources: Vec<Box<dyn RowGroupSource>> = Vec::with_capacity(files.len());
-        for file in files {
-            sources.push(Box::new(ParquetShard::from_hub(
-                repo,
-                file,
-                text_column,
-                revision,
-            )?));
-        }
-        Self::new(sources, tokenizer, seq_len, cache_groups)
+        Self::new(
+            parquet_sources(repo, revision, files, text_column)?,
+            tokenizer,
+            seq_len,
+            cache_groups,
+        )
     }
 
     /// Total dense windows across all sources (before any `view`).

@@ -17,7 +17,7 @@
 use crate::chat::SpecialToken;
 use crate::config;
 use crate::constants::FINEWEB_REPO;
-use crate::data::{ParquetShard, RowGroupSource, SoftwareHeritageSource};
+use crate::data::{collect_docs, parquet_sources, swh_sources};
 use eyre::{Result, WrapErr};
 use std::path::{Path, PathBuf};
 use strum::IntoEnumIterator;
@@ -45,25 +45,22 @@ pub fn run(vocab_size: usize, docs_per_domain: usize, out: Option<PathBuf>) -> R
     let mut texts: Vec<String> = Vec::new();
 
     println!("sampling web (FineWeb) up to {docs_per_domain} docs...");
-    gather_parquet(
-        &mut texts,
-        FINEWEB_REPO,
-        "main",
-        &rc.shards,
-        "text",
+    texts.extend(collect_docs(
+        &parquet_sources(FINEWEB_REPO, "main", &rc.shards, "text")?,
         docs_per_domain,
-    )?;
+    )?);
 
     if !rc.math_shards.is_empty() {
         println!("sampling math up to {docs_per_domain} docs...");
-        gather_parquet(
-            &mut texts,
-            &rc.math_repo,
-            &rc.math_revision,
-            &rc.math_shards,
-            &rc.math_text_column,
+        texts.extend(collect_docs(
+            &parquet_sources(
+                &rc.math_repo,
+                &rc.math_revision,
+                &rc.math_shards,
+                &rc.math_text_column,
+            )?,
             docs_per_domain,
-        )?;
+        )?);
     }
 
     if !rc.code_shards.is_empty() {
@@ -71,7 +68,16 @@ pub fn run(vocab_size: usize, docs_per_domain: usize, out: Option<PathBuf>) -> R
             "sampling code (Stack-Edu via Software Heritage) up to {} files...",
             rc.code_max_files.min(docs_per_domain)
         );
-        gather_swh(&mut texts, rc, docs_per_domain)?;
+        texts.extend(collect_docs(
+            &swh_sources(
+                &rc.code_repo,
+                &rc.code_revision,
+                &rc.code_shards,
+                &rc.code_blob_column,
+                rc.code_max_files.min(docs_per_domain),
+            )?,
+            docs_per_domain,
+        )?);
     }
 
     println!(
@@ -137,70 +143,6 @@ pub fn run(vocab_size: usize, docs_per_domain: usize, out: Option<PathBuf>) -> R
     );
 
     verify(&out)?;
-    Ok(())
-}
-
-// TODO: These are all duplicate and should live authoritatively in data.rs combining
-// all data retreival functions across every phase of training.
-
-/// Pull up to `max_docs` documents from `text_column` across `shards` of a HF parquet.
-fn gather_parquet(
-    out: &mut Vec<String>,
-    repo: &str,
-    revision: &str,
-    shards: &[String],
-    text_column: &str,
-    max_docs: usize,
-) -> Result<()> {
-    let mut n = 0;
-    for file in shards {
-        if n >= max_docs {
-            break;
-        }
-        let shard = ParquetShard::from_hub(repo, file, text_column, revision)?;
-        for g in 0..shard.num_groups() {
-            if n >= max_docs {
-                break;
-            }
-            for doc in shard.group_texts(g)? {
-                out.push(doc);
-                n += 1;
-                if n >= max_docs {
-                    break;
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Pull code documents (Stack-Edu blobs fetched from Software Heritage).
-fn gather_swh(out: &mut Vec<String>, rc: &config::RunConfig, max_docs: usize) -> Result<()> {
-    let mut n = 0;
-    for file in &rc.code_shards {
-        if n >= max_docs {
-            break;
-        }
-        let src = SoftwareHeritageSource::from_hub(
-            &rc.code_repo,
-            &rc.code_revision,
-            file,
-            &rc.code_blob_column,
-            rc.code_max_files.min(max_docs),
-        )?;
-        for g in 0..src.num_groups() {
-            if n >= max_docs {
-                break;
-            }
-            for doc in src.group_texts(g)? {
-                out.push(doc);
-                n += 1;
-                if n >= max_docs {
-                    break;
-                }
-            }
-        }
-    }
     Ok(())
 }
 
