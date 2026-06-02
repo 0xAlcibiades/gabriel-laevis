@@ -28,14 +28,14 @@ Dimensions are runtime config knobs, so doing a larger run is a config change aw
 
 `train` trains the model, one stage per run; `serve` serves inference for a trained model. Run either with `--help` for the full set of args.
 
-| Command              | What it does                               |
-| -------------------- | ------------------------------------------ |
-| `train pretrain`     | Pretrain on a decay-annealed web/math/code mix |
-| `train sft`          | Instruction-tune (ChatML, response-masked) |
-| `train dpo`          | Preference-optimize the SFT model          |
+| Command              | What it does                                                                         |
+| -------------------- | ------------------------------------------------------------------------------------ |
+| `train pretrain`     | Pretrain on a decay-annealed web/math/code mix                                       |
+| `train sft`          | Instruction-tune (ChatML, response-masked)                                           |
+| `train dpo`          | Preference-optimize the SFT model                                                    |
 | `train grpo`         | RL on [GSM8K](https://huggingface.co/datasets/openai/gsm8k) with a verifiable reward |
-| `train all`          | Run all four stages in order               |
-| `serve <checkpoint>` | OpenAI-compatible inference server         |
+| `train all`          | Run all four stages in order                                                         |
+| `serve <checkpoint>` | OpenAI-compatible inference server                                                   |
 
 Each `train` stage continues from the prior stage's checkpoint and auto-resumes from the latest, e.g.:
 
@@ -63,8 +63,8 @@ When building either binary you should pick one backend feature i.e. `ndarray`/`
 - [Stack-Edu](https://huggingface.co/datasets/HuggingFaceTB/stack-edu) — code pretraining corpus.
 - [OpenAssistant (oasst_top1)](https://huggingface.co/datasets/OpenAssistant/oasst_top1_2023-08-25) — SFT instruction data.
 - [orpo-dpo-mix-40k](https://huggingface.co/datasets/mlabonne/orpo-dpo-mix-40k-flat) — DPO preference data.
-- [GSM8K](https://huggin
+- [GSM8K](https://huggingface.co/datasets/openai/gsm8k) — GRPO task.
 
 ## License
 
-MIT, see [LISCENCE](LISCENCE).
+MIT, see [LICENSE](LICENSE).

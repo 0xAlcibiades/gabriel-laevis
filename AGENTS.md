@@ -17,8 +17,8 @@ This file is the working notes; see References for the overview and API.
 
 ## Running
 
-- `train <stage>`: `tokenizer` → `pretrain` → `sft` → `dpo` → `grpo`; `train all` 
-  runs the chain. Each stage starts from the prior checkpoint, checkpoints on a 
+- `train <stage>`: `tokenizer` → `pretrain` → `sft` → `dpo` → `grpo`; `train all`
+  runs the chain. Each stage starts from the prior checkpoint, checkpoints on a
   fixed step interval, and auto-resumes — a crash loses at most one interval.
   `--help` for per-stage args.
 - `serve <checkpoint>`: OpenAI-compatible axum server, SSE streaming, per-request `seed`.

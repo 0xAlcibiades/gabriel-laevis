@@ -4,6 +4,10 @@ use burn::config::Config;
 use serde::Deserialize;
 use std::path::PathBuf;
 
+/// Max SSD scan chunk length. Above this, f32 accumulation in the per-chunk matmuls drifts
+/// the chunked scan off the serial recurrence on Metal (see `chunk_precision_sweep`).
+const MAX_CHUNK: usize = 48;
+
 /// Architecture dimensions for one model.
 #[derive(Config, Debug)]
 pub struct ModelConfig {
@@ -190,10 +194,22 @@ impl RunConfig {
                 .with_list_parse_key("code_shards"),
         );
         // Defaults fill anything unset; a malformed source falls back to defaults.
-        builder
+        let mut c = builder
             .build()
             .and_then(|c| c.try_deserialize::<RunConfig>())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        // Clamp the SSD scan chunk into its valid range so it can't be misconfigured: above
+        // `MAX_CHUNK` the chunked scan drifts off the serial recurrence in f32 on Metal, and
+        // 0 would break the chunk math. This is the single enforcement point.
+        let chunk = c.chunk.clamp(1, MAX_CHUNK);
+        if chunk != c.chunk {
+            eprintln!(
+                "chunk {} out of range [1, {MAX_CHUNK}]; using {chunk}",
+                c.chunk
+            );
+            c.chunk = chunk;
+        }
+        c
     }
 }
 
@@ -201,16 +217,7 @@ impl RunConfig {
 pub fn run() -> &'static RunConfig {
     use std::sync::OnceLock;
     static RUN: OnceLock<RunConfig> = OnceLock::new();
-    RUN.get_or_init(|| {
-        let c = RunConfig::load();
-        if c.chunk > 48 {
-            eprintln!(
-                "warning: chunk={} > 48 degrades scan/step equivalence; use 48 or less.",
-                c.chunk
-            );
-        }
-        c
-    })
+    RUN.get_or_init(RunConfig::load)
 }
 
 #[cfg(test)]
