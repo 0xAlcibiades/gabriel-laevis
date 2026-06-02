@@ -1,19 +1,14 @@
 //! External data sources and run-wide defaults.
 
-/// Pretraining corpus (web).
+/// Web pretraining corpus.
 pub const FINEWEB_REPO: &str = "HuggingFaceFW/fineweb-edu";
 pub const FINEWEB_SHARD: &str = "sample/10BT/000_00000.parquet";
 
-/// Math corpus for the multi-stage decay anneal. FineMath exposes a `text` column, so it
-/// drops into the streaming loader; its shards live on the auto-converted parquet ref.
-/// On by default (see `RunConfig`); `GL_MATH_SHARDS=""` disables it.
+/// Math pretraining corpus.
 pub const FINEMATH_REPO: &str = "HuggingFaceTB/finemath";
 pub const FINEMATH_SHARD: &str = "finemath-3plus/train/0000.parquet";
 
-/// Code corpus. Stack-Edu ships SWHIDs (`blob_id`) + metadata, NOT code text — content
-/// lives on Software Heritage's S3 (`content/{blob_id}`, gzipped), fetched per file by
-/// `SoftwareHeritageSource`. On by default but capped (`RunConfig::code_max_files`), since
-/// each file is an HTTP GET.
+/// Code pretraining corpus.
 pub const STACK_EDU_REPO: &str = "HuggingFaceTB/stack-edu";
 pub const STACK_EDU_SHARD: &str = "Python/train/0000.parquet";
 
@@ -29,10 +24,10 @@ pub const NUM_WORKERS: usize = 2;
 pub const DPO_REPO: &str = "mlabonne/orpo-dpo-mix-40k-flat";
 pub const DPO_FILE: &str = "default/train/0000.parquet";
 
-/// DPO temperature β (implicit-reward / KL strength); 0.1 is the common default.
+/// DPO temperature β.
 pub const DPO_BETA: f64 = 0.1;
 
-/// GRPO task: GSM8K grade-school math.
+/// GRPO task.
 pub const GSM8K_REPO: &str = "openai/gsm8k";
 pub const GSM8K_FILE: &str = "main/train/0000.parquet";
 
@@ -40,7 +35,7 @@ pub const GSM8K_FILE: &str = "main/train/0000.parquet";
 pub const GRPO_GROUP_SIZE: usize = 4;
 pub const GRPO_KL_BETA: f64 = 0.04;
 
-/// Post-training sequence lengths. Pretrain uses `RunConfig::max_seq_len`.
+/// Post-training sequence lengths.
 pub const SFT_SEQ_LEN: usize = 512;
 pub const DPO_SEQ_LEN: usize = 512;
 

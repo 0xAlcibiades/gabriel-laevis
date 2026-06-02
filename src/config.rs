@@ -8,7 +8,7 @@ use std::path::PathBuf;
 #[derive(Config, Debug)]
 pub struct ModelConfig {
     /// Vocabulary size, which is set at runtime from the tokenizer's `vocab_size`.
-    #[config(default = 49152)]
+    #[config(default = 16384)]
     pub vocab_size: usize,
     /// Residual-stream width.
     #[config(default = 384)]
@@ -37,10 +37,7 @@ pub struct ModelConfig {
     /// context limit.
     #[config(default = 2048)]
     pub max_seq_len: usize,
-    /// Std of the N(0, std) embedding initializer. Burn's Embedding defaults to
-    /// N(0, 1), which — through the tied output head — makes initial logits ~√d_model×
-    /// too large (loss ≈ 82 vs the ln(vocab) ≈ 10.8 a well-scaled LM starts at). 0.02
-    /// is the standard small-init.
+    /// Std of the N(0, std) embedding initializer.
     #[config(default = 0.02)]
     pub init_std: f64,
 }
@@ -51,19 +48,12 @@ impl ModelConfig {
         self.expand * self.d_model
     }
 
-    /// Number of attention-style heads (`d_inner / headdim`).
+    /// Number of attention-style heads.
     pub fn nheads(&self) -> usize {
         self.d_inner() / self.headdim
     }
 
-    /// Check the architectural shape invariants the Mamba-3 block relies on,
-    /// returning a clean error instead of panicking deep inside a tensor reshape.
-    ///
-    /// These were `debug_assert!`s in `Mamba3Block::new`, but real runs build with
-    /// `--profile=maxperf`, which sets `debug-assertions = false`, and the dims come
-    /// from `GL_` env vars — so a fat-fingered config would otherwise blow up far
-    /// from its cause (or, with overflow-checks off, worse). Call this right after
-    /// constructing or loading a `ModelConfig`.
+    /// Check the architectural shape invariants the Mamba-3 block relies on.
     pub fn validate(&self) -> eyre::Result<()> {
         let d_inner = self.d_inner();
         if self.headdim == 0 || !d_inner.is_multiple_of(self.headdim) {
@@ -98,8 +88,10 @@ impl Default for ModelConfig {
 }
 
 /// Output, checkpoint, and token-cache directory. Set `MODEL_DIR` to override the
-/// `/tmp/gabriel-laevis` default. Every command reads this. Dataset and tokenizer
-/// downloads use the standard Hugging Face cache under `HF_HOME`.
+/// default.
+///
+/// In contra, dataset and downloads use the standard Hugging Face cache
+/// under `HF_HOME`.
 pub fn artifact_dir() -> PathBuf {
     std::env::var_os("MODEL_DIR")
         .map(PathBuf::from)
@@ -109,7 +101,7 @@ pub fn artifact_dir() -> PathBuf {
 /// One training run's configuration: model size, data shards, and the memory and
 /// performance knobs. Values come from built-in defaults, then a config file named by
 /// `GL_CONFIG`, then `GL_` environment variables, so a run can be resized without
-/// recompiling. `vocab_size` is excluded and comes from the tokenizer at runtime.
+/// recompiling.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct RunConfig {
@@ -121,11 +113,8 @@ pub struct RunConfig {
     pub d_ff: usize,
     pub expand: usize,
     pub max_seq_len: usize,
-    /// Std of the N(0, std) embedding initializer (see `ModelConfig::init_std`).
     pub init_std: f64,
-    /// Pretrain batch size. Dominates LM-head memory; lower it on tight machines.
     pub batch: usize,
-    /// SSD scan chunk length. Keep at most 48 for f32 rescale precision.
     pub chunk: usize,
     pub cache_groups: u64,
     pub shards: Vec<String>,

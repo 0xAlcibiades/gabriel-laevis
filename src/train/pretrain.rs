@@ -1,5 +1,11 @@
 //! Pretraining stage using next-token cross-entropy.
 
+use crate::constants::{FINEWEB_REPO, NUM_WORKERS, SHUFFLE_SEED};
+use crate::data::{
+    MixSchedule, MixtureDataset, SoftwareHeritageSource, StreamingTokenDataset, TokenBatcher,
+    load_tokenizer,
+};
+use crate::train::TrainingContext;
 use burn::config::Config;
 use burn::data::dataloader::DataLoaderBuilder;
 use burn::data::dataset::transform::SamplerDataset;
@@ -11,13 +17,6 @@ use burn::train::metric::{LossMetric, PerplexityMetric};
 use burn::train::{Learner, SupervisedTraining};
 use eyre::Result;
 
-use crate::constants::{FINEWEB_REPO, NUM_WORKERS, SHUFFLE_SEED};
-use crate::data::{
-    MixSchedule, MixtureDataset, SoftwareHeritageSource, StreamingTokenDataset, TokenBatcher,
-    load_tokenizer,
-};
-use crate::train::TrainingContext;
-
 const VALID_WINDOWS: usize = 64;
 const LR_MAX: f64 = 3.0e-4;
 const LR_MIN: f64 = 3.0e-5;
@@ -25,10 +24,9 @@ const GRAD_CLIP_NORM: f32 = 1.0;
 const ADAM_BETA1: f32 = 0.9;
 const ADAM_BETA2: f32 = 0.95;
 
-/// Data-mix decay anneal (web, math, code), after SmolLM3's multi-stage recipe: a
-/// web-heavy stable bulk, then upweight math+code over the cosine-LR decay tail. Weights
-/// are renormalized over whichever domains are actually configured (math/code are added
-/// only when their shard lists are set), so web-only runs are unaffected.
+/// Data-mix decay anneal, taking a page from SmolLM3's multi-stage recipe: a web-heavy
+/// stable bulk, then upweight math+code over the cosine-LR decay tail. Weights are
+/// renormalized over whichever domains are actually configured.
 const MIX_STABLE: [f64; 3] = [0.85, 0.03, 0.12]; // ≈ SmolLM3 stage 1
 const MIX_DECAY: [f64; 3] = [0.63, 0.13, 0.24]; // ≈ SmolLM3 stage 3
 const DECAY_START: f64 = 0.85; // ramp the mix over the final 15% of steps
@@ -44,8 +42,7 @@ pub fn run(
     let seq_len = rc.max_seq_len;
 
     // Streaming corpus: dense seq_len+1 windows packed per row group, tokenized on
-    // access, never held whole in RAM (viable for 5B+ tokens). An owned Arc tokenizer
-    // is needed because the dataset must be Send+Sync across dataloader workers.
+    // access.
     println!("indexing FineWeb-Edu shards...");
     let tokenizer = std::sync::Arc::new(load_tokenizer()?);
 
@@ -61,8 +58,8 @@ pub fn run(
 
     let windows_total = corpus.total();
 
-    // Window counts are exact (the count pass tokenized every group), so the token
-    // budget maps directly: keep the first `max_tokens`-worth of dense windows. 0 = all.
+    // Window counts are exact, so the token budget maps directly: keep the first
+    // `max_tokens`-worth of dense windows. 0 = all.
     let budget_windows = if max_tokens == 0 {
         windows_total
     } else {
@@ -70,7 +67,7 @@ pub fn run(
     };
 
     println!(
-        "using {budget_windows} windows (~{} tokens)",
+        "using {budget_windows} windows with ~{} tokens total",
         budget_windows * (seq_len + 1)
     );
 
@@ -101,7 +98,7 @@ pub fn run(
     let mut stable = vec![MIX_STABLE[0]];
     let mut decay = vec![MIX_DECAY[0]];
 
-    // Math: a plain text-column parquet corpus (FineMath).
+    // Math: FineMath is a plain text-column parquet corpus.
     if !rc.math_shards.is_empty() {
         println!("indexing math corpus ({} shards)...", rc.math_shards.len());
         domains.push(StreamingTokenDataset::from_hub(
@@ -117,8 +114,9 @@ pub fn run(
         decay.push(MIX_DECAY[1]);
     }
 
-    // Code: Stack-Edu ships SWHIDs, so each shard is a SoftwareHeritageSource that fetches
-    // up to `code_max_files` blobs' content from Software Heritage's S3.
+    // Code: Stack-Edu ships SWHIDs, so each shard is a SoftwareHeritageSource
+    // that fetches up to `code_max_files` blobs' content from Software Heritage's
+    // S3.
     if !rc.code_shards.is_empty() {
         println!(
             "indexing code corpus ({} shards, ≤{} files each via Software Heritage)...",
@@ -193,7 +191,7 @@ pub fn run(
         .summary();
 
     // Auto-resume from the latest checkpoint in the artifact dir unless `--from` was
-    // given (which starts a fresh schedule from the named weights).
+    // given.
     let epoch_to_resume = from
         .is_none()
         .then(|| ctx.latest_checkpoint_epoch(&ctx.artifact))

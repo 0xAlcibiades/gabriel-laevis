@@ -1,5 +1,9 @@
 //! The language model with embeddings, stacked layers, norm, and tied head.
 
+use crate::config::ModelConfig;
+use crate::data::Batch;
+use crate::model::block::Layer;
+use crate::model::mamba3::Mamba3State;
 use burn::module::Initializer;
 use burn::module::Module;
 use burn::nn::loss::{CrossEntropyLoss, CrossEntropyLossConfig};
@@ -11,11 +15,6 @@ use burn::tensor::backend::AutodiffBackend;
 use burn::train::{ClassificationOutput, InferenceStep, TrainOutput, TrainStep};
 use eyre::{Result, eyre};
 use rayon::prelude::*;
-
-use crate::config::ModelConfig;
-use crate::data::Batch;
-use crate::model::block::Layer;
-use crate::model::mamba3::Mamba3State;
 
 #[derive(Module, Debug)]
 pub struct GabrielLaevis<B: Backend> {
@@ -30,7 +29,6 @@ impl<B: Backend> GabrielLaevis<B> {
     pub fn new(cfg: &ModelConfig, device: &B::Device) -> Self {
         let layers = (0..cfg.n_layers).map(|_| Layer::new(cfg, device)).collect();
         Self {
-            // Small-init embedding (see `ModelConfig::init_std`), tied to the output head.
             embed: EmbeddingConfig::new(cfg.vocab_size, cfg.d_model)
                 .with_initializer(Initializer::Normal {
                     mean: 0.0,
@@ -46,8 +44,11 @@ impl<B: Backend> GabrielLaevis<B> {
         }
     }
 
-    /// The device this model's parameters live on. O(1) — reads one param, unlike
-    /// `Module::devices()` which allocates a `Vec` and walks the whole module graph.
+    /// The device this model's parameters live on.
+    ///
+    /// NOTE:
+    /// Reads one param, unlike `Module::devices()` which allocates a `Vec`
+    /// and walks the whole module graph.
     pub fn device(&self) -> B::Device {
         self.embed.weight.val().device()
     }
@@ -112,16 +113,13 @@ impl<B: Backend> GabrielLaevis<B> {
     /// Prime a prompt in a single parallel pass: run all layers' parallel prefill over
     /// the `[1, T]` prompt, collecting each layer's carried recurrent state, and return
     /// the next-token logits `[vocab]` alongside the per-layer states ready for decoding.
-    /// Replaces the O(T) token-by-token priming loop (one chunked scan per layer instead
-    /// of `T` serial steps), which is the time-to-first-token win for long prompts. The
-    /// caller guarantees a non-empty prompt.
+    /// The caller guarantees a non-empty prompt.
     fn prime_prompt(
         &self,
         prompt: &[i64],
         device: &B::Device,
     ) -> (Tensor<B, 1>, Vec<Mamba3State<B>>) {
         let t = prompt.len();
-        // Straight from the id slice to the tensor — no intermediate owned Vec.
         let prompt_ids =
             Tensor::<B, 1, Int>::from_data(TensorData::from(prompt), device).reshape([1, t]);
         let mut x = self.embed.forward(prompt_ids); // [1, T, d_model]
@@ -182,9 +180,8 @@ impl<B: Backend> GabrielLaevis<B> {
     }
 
     /// Streaming generation: invokes `on_token` with each new token id as it is
-    /// produced (the cached recurrent step). Returning `false` from `on_token`
-    /// stops generation early — e.g. when a streaming client disconnects. Errors on
-    /// an empty prompt (nothing to prime the recurrence from).
+    /// produced. Returning `false` from `on_token` stops generation early — e.g.
+    /// when a streaming client disconnects. Errors on an empty prompt.
     pub fn generate_with<F: FnMut(i64) -> bool>(
         &self,
         prompt: &[i64],
@@ -196,17 +193,15 @@ impl<B: Backend> GabrielLaevis<B> {
         if prompt.is_empty() {
             return Err(eyre!("prompt must be non-empty"));
         }
-        // Prime the prompt in a single parallel pass (one chunked scan per layer instead
-        // of T serial steps), then decode from the carried per-layer states.
+        // Prime the prompt
         let (mut logits, mut states) = self.prime_prompt(prompt, device);
 
         // Per-token generated counts for the penalties, kept on-device as a [vocab]
-        // tally — only when a penalty is actually active.
+        // tally only when a penalty is actually active.
         let vocab = logits.dims()[0];
         let penalize = sampling.frequency_penalty != 0.0 || sampling.presence_penalty != 0.0;
         let mut counts = penalize.then(|| Tensor::<B, 1>::zeros([vocab], device));
-        // Seeded host-side sampling noise (reproducible, per-request, independent across
-        // concurrent generations) vs the shared device RNG. Only built when sampling.
+        // Seeded host-side sampling noise. Only built when sampling.
         let mut rng = match (sampling.temperature > 0.0, sampling.seed) {
             (true, Some(s)) => Some(fastrand::Rng::with_seed(s)),
             _ => None,
@@ -221,8 +216,9 @@ impl<B: Backend> GabrielLaevis<B> {
             });
             let next = sampling.pick(logits, counts.as_ref(), noise);
             let id = next.clone().into_scalar().elem::<i64>();
-            // EOS: stop before emitting the stop token, so it never lands in the
-            // output (or in a GRPO completion that gets re-tokenized for scoring).
+
+            // EOS: Stop before emitting the stop token, so it never lands in the
+            // output.
             if sampling.stop_token == Some(id) {
                 break;
             }
@@ -243,11 +239,10 @@ impl<B: Backend> GabrielLaevis<B> {
 
     /// Generate `g` completions for a single `prompt` in one batched recurrent pass:
     /// the prompt is primed **once** at batch 1, its state fanned out to `g` rows, then
-    /// `g` sequences are sampled in parallel (one batched step per token instead of
-    /// `g` separate generations). Each row stops at `sampling.stop_token`; rows can end
-    /// at different lengths, so the returned completions are ragged. Only the
-    /// temperature/seed/stop of `sampling` apply — the top-k/p/min-p filters and
-    /// penalties are ignored (this is the GRPO rollout path). Errors on an empty prompt.
+    /// `g` sequences are sampled in parallel. Each row stops at `sampling.stop_token`;
+    /// rows can end at different lengths, so the returned completions are ragged. Only
+    /// the temperature/seed/stop of `sampling` apply — the top-k/p/min-p filters and
+    /// penalties are ignored. Errors on an empty prompt.
     pub fn generate_group(
         &self,
         prompt: &[i64],
@@ -264,14 +259,14 @@ impl<B: Backend> GabrielLaevis<B> {
         let vocab = logits1.dims()[0];
 
         // Fan the primed state + logits out to g rows. `expand` broadcasts the single
-        // primed row to `[g, vocab]` as a stride-only view — no host Vec, no `cat` kernel.
+        // primed row to `[g, vocab]` as a stride-only view.
         let mut states: Vec<Mamba3State<B>> =
             states.into_iter().map(|st| st.broadcast_batch(g)).collect();
         let mut logits = logits1.reshape([1, vocab]).expand([g, vocab]); // [g, vocab]
 
         // One independent PRNG per row, deterministically forked from the seed. Lets the
-        // per-token noise fill run row-parallel (below) and keeps rows reproducible and
-        // independent. Only built when sampling.
+        // per-token noise fill run row-parallel and keeps rows reproducible and independent.
+        // Only built when sampling.
         let mut row_rngs: Option<Vec<fastrand::Rng>> =
             match (sampling.temperature > 0.0, sampling.seed) {
                 (true, Some(s)) => {
@@ -280,14 +275,12 @@ impl<B: Backend> GabrielLaevis<B> {
                 }
                 _ => None,
             };
-        // Output rows pre-sized to their cap; `vec![Vec::new(); g]` would reallocate each
-        // row as it grows, and `vec![Vec::with_capacity(_); g]` clones to len-0 capacity.
+        // Output rows pre-sized to their cap.
         let mut out: Vec<Vec<i64>> = (0..g).map(|_| Vec::with_capacity(max_new)).collect();
         let mut finished = vec![false; g];
 
         for _ in 0..max_new {
-            // Per-row noise filled in parallel: each thread owns one row's chunk and its
-            // own PRNG, so there's no contention and no single-threaded g·vocab fill.
+            // Per-row noise filled in parallel.
             let noise = row_rngs.as_mut().map(|rngs| {
                 let mut u = vec![0.0f32; g * vocab];
                 u.par_chunks_mut(vocab)
@@ -334,7 +327,7 @@ pub fn sequence_logprob<B: Backend>(
     // target logit ([B,T]) and subtract a max-shifted (overflow-safe) log-sum-exp over
     // the vocab ([B,T]). Identical to the log_softmax formulation (see
     // `sequence_logprob_matches_log_softmax`) but without the extra dense head-sized
-    // activation — a meaningful DPO memory/bandwidth saving on a vocab-heavy head.
+    // activation.
     let idx = targets.clone().clamp(0, v as i64 - 1).reshape([b, t, 1]);
     let chosen = logits.clone().gather(2, idx).reshape([b, t]); // z_target  [B,T]
     let m = logits.clone().max_dim(2); // [B,T,1] shift for numerical stability
@@ -354,25 +347,16 @@ pub fn sequence_logprob<B: Backend>(
 
 /// Sampling controls. `temperature <= 0` is greedy (`argmax`); otherwise the logits
 /// are scaled by `temperature`, optionally filtered by top-k, then min-p, then
-/// nucleus (top-p), and sampled. All of it runs on-device in the model's native
-/// dtype (see [`Sampling::pick`]).
+/// nucleus (top-p), and sampled. See [`Sampling::pick`].
 #[derive(Clone, Debug)]
 pub struct Sampling {
     pub temperature: f64,
     pub top_k: Option<usize>,
     pub top_p: Option<f32>,
     pub min_p: Option<f32>,
-    /// Penalize tokens by how many times they've already been generated.
     pub frequency_penalty: f32,
-    /// Penalize tokens that have appeared at all (flat).
     pub presence_penalty: f32,
-    /// Stop generation when this token id is drawn (e.g. `<|im_end|>`). The stop
-    /// token is **not** emitted. `None` generates exactly `max_new` tokens.
     pub stop_token: Option<i64>,
-    /// Per-request RNG seed. When set, the Gumbel sampling noise is drawn from a
-    /// seeded host-side PRNG (uploaded per step) instead of the shared device RNG, so
-    /// generation is reproducible and independent across concurrent requests. `None`
-    /// uses the device RNG (fast, not reproducible). Ignored when greedy.
     pub seed: Option<u64>,
 }
 
@@ -400,7 +384,7 @@ impl Sampling {
         }
     }
 
-    /// Pick the next token from `logits` `[vocab]`, entirely on-device in the model's
+    /// Picks the next token from `logits` `[vocab]`, entirely on-device in the model's
     /// native dtype, returning the chosen id as a `[1]` Int tensor (so it flows into
     /// the next step and the penalty tally without a host round-trip). `counts` (when
     /// penalties are active) is the `[vocab]` tally of prior generations.
@@ -450,9 +434,9 @@ impl Sampling {
 
     /// Batched pick over `[g, vocab]` → `[g]` ids: greedy (temperature ≤ 0) or
     /// temperature Gumbel-max per row. Unlike [`Sampling::pick`] this applies **only**
-    /// the temperature — the top-k/p/min-p filters and penalties are skipped (it backs
-    /// the GRPO rollout, which uses neither). `noise`, if given, are seeded host
-    /// uniforms `[g, vocab]`; otherwise the device RNG is used.
+    /// the temperature — the top-k/p/min-p filters and penalties are skipped.
+    /// `noise`, if given, are seeded host uniforms `[g, vocab]`; otherwise the device
+    /// RNG is used.
     fn pick_batch<B: Backend>(
         &self,
         logits: Tensor<B, 2>,
@@ -505,9 +489,8 @@ impl Sampling {
         //
         // The descending sort is O(V·log V) and irreducible here: Burn's `topk` is itself
         // a full `sort_descending` + `select`, so a "truncate-with-topk-first" pass would
-        // be a second sort, not a saving. We do use `sort_descending` (values only) rather
-        // than `sort_descending_with_indices` — the index permutation was computed and
-        // discarded, an extra [vocab] tensor of work per token for nothing.
+        // be a second sort, not a saving. We do use `sort_descending` with values only
+        // rather than `sort_descending_with_indices`
         if let Some(top_p) = self.top_p {
             let p = activation::softmax(l.clone(), 0);
             let sorted = p.clone().sort_descending(0);
@@ -659,9 +642,7 @@ mod tests {
         assert_eq!(a, b, "same seed must give identical samples");
     }
 
-    /// The batched group rollout (prime-once + fan-out + batched step) must reproduce
-    /// the serial greedy path exactly, for every row — the correctness guarantee that
-    /// lets GRPO trust `generate_group`.
+    /// The batched group rollout must reproduce the serial greedy path exactly, for every row.
     #[test]
     fn generate_group_matches_serial_greedy() {
         let device = Default::default();

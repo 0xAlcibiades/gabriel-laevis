@@ -1,27 +1,32 @@
-//! Conversation template — Gemma-4-style control tokens: turns, roles, rendering.
+//! Conversation template
 //!
-//! A turn is `<|turn>{role}\n…<turn|>`; roles render as plain words (`system`, `user`,
-//! `model`). Optional reasoning renders in a thought channel
-//! (`<|channel>thought\n…\n<channel|>`) before the content. The tokenizer reserves the
-//! full modern control-token set (tool-calling, image/audio/video) for later; only the
-//! text + thinking path is rendered here.
+//! Leverages Gemma-4-style control tokens: turns, roles, rendering.
+//!
+//! - A turn is `<|turn>{role}\n…<turn|>`.
+//! - Roles render as plain words.
+//! - Optional reasoning renders in a thought channel (`<|channel>thought\n…\n<channel|>`)
+//!   before the content.
+//!
+//! TODO:
+//! The tokenizer reserves the full modern control-token set (tool-calling, image/audio/video);
+//! only the text + thinking path is rendered here. This needs an update accordingly.
 
-/// Loss-ignore / pad target id. `<pad>` is the first reserved special token (id 0), so it
-/// never appears as a real target: the cross-entropy loss drops it (`with_pad_tokens`),
-/// masking prompt and padding so SFT trains only on the model's response. A no-op for
-/// pretraining (never emitted as a target there).
+/// `<pad>` is a reserved special token with id 0, so it never appears as a real target.
 pub const IGNORE_ID: usize = 0;
 
-/// Token id of the turn terminator `<turn|>`, used as the generation stop token (so
-/// completions end at the turn boundary instead of running to the length cap). Returns
-/// `None` if the tokenizer doesn't map it to a single id.
+/// Token id of the turn terminator `<turn|>`, used as the generation stop token.
+///
+/// Returns `None` if the tokenizer doesn't map it to a single id.
+///
+/// TODO:
+/// However, it is a known ID by construction, so we should choose here instead
+/// the known numeric id from tokenizer.rs
 pub fn turn_end_id(tok: &fastokens::Tokenizer) -> Option<i64> {
     let ids = tok.encode("<turn|>").ok()?;
     (ids.len() == 1).then(|| ids[0] as i64)
 }
 
-/// Conversation role. The assistant turn renders as `model` (Gemma convention);
-/// `Developer`/`Tool` keep their own role words.
+/// Conversation role.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Role {
     System,
@@ -85,10 +90,9 @@ impl Message {
     }
 }
 
-/// Render a conversation to the turn format. With `add_generation_prompt`, append an open
-/// `model` turn for the model to continue. Sized up front into a single buffer.
+/// Render a conversation to the turn format.
 pub fn render(messages: &[Message], add_generation_prompt: bool) -> String {
-    // Estimate the buffer size to avoid reallocations (tags + content per turn).
+    // Estimate the buffer size to avoid spurious reallocations.
     let est_len: usize = messages.iter().map(|m| m.content.len() + 64).sum::<usize>()
         + if add_generation_prompt { 16 } else { 0 };
 
@@ -115,12 +119,14 @@ pub fn render(messages: &[Message], add_generation_prompt: bool) -> String {
     out
 }
 
-/// The prompt (user turn + open model turn) the model must continue.
+/// The prompt which the model must continue.
 pub fn render_prompt(user: &str) -> String {
     render(&[Message::user(user)], true)
 }
 
-/// The full templated SFT example: user turn + model response, closed. Note
+/// The full templated example for SFT: user turn + model response, closed.
+///
+/// NOTE:
 /// `render_prompt(user)` is a prefix of this, which the response-loss masking in
 /// `build_sft_row` relies on.
 pub fn render_full(user: &str, assistant: &str) -> String {

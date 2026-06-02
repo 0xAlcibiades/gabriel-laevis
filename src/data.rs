@@ -1,15 +1,4 @@
-//! Data layer: tokenizer, parquet ingestion, and the per-stage datasets/batchers.
-//!
-//! Layout, top to bottom: tokenizer loading → shared parquet helpers → generic
-//! batch/split helpers → pretraining (streaming corpus) → SFT → DPO → GRPO. Each
-//! training stage owns one section: its loader, example, `Dataset`, batch, and
-//! `Batcher` live together.
-
-use std::fs::File;
-use std::io::Read;
-use std::path::PathBuf;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+//! Data layer
 
 use burn::data::dataloader::batcher::Batcher;
 use burn::data::dataset::Dataset;
@@ -17,6 +6,11 @@ use burn::prelude::*;
 use eyre::{Result, WrapErr};
 use parquet::file::reader::{FileReader, SerializedFileReader};
 use parquet::record::{Row, RowAccessor};
+use std::fs::File;
+use std::io::Read;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::config::artifact_dir;
 
@@ -24,9 +18,9 @@ use crate::config::artifact_dir;
 // Tokenizer
 // ===========================================================================
 
-/// Load the byte-level BPE tokenizer trained by `train tokenizer`, read from
-/// `$MODEL_DIR/tokenizer.json`. Errors (rather than fetching anything) if it isn't there
-/// yet — train the tokenizer before any other stage.
+/// Load tokenizer
+///
+/// TODO: Dry this and don't duplicate the same function everywhere.
 pub fn load_tokenizer() -> Result<fastokens::Tokenizer> {
     let path = artifact_dir().join("tokenizer.json");
     fastokens::Tokenizer::from_file(&path).wrap_err_with(|| {
@@ -38,15 +32,10 @@ pub fn load_tokenizer() -> Result<fastokens::Tokenizer> {
 }
 
 // ===========================================================================
-// Shared parquet ingestion
+// Dataset ingestion
 // ===========================================================================
-//
-// The SFT/DPO/GRPO loaders all read a HF-hosted dataset parquet (the auto-converted
-// `refs/convert/parquet` revision), resolve a few columns by name, and iterate rows
-// until a cap. These three helpers factor out that shape so each loader is just its
-// column names plus a per-row extractor.
 
-/// Fetch + open a Hub dataset parquet file from the auto-converted parquet revision.
+/// Fetch and open a Hub dataset parquet file from the auto-converted parquet revision.
 fn open_hub_dataset_parquet(repo: &str, file: &str) -> Result<SerializedFileReader<File>> {
     use hf_hub::api::sync::Api;
     use hf_hub::{Repo, RepoType};
@@ -102,7 +91,7 @@ fn read_rows<T>(
 // Generic helpers shared across stages
 // ===========================================================================
 
-/// Split `rows` into `(train, valid)` with a **disjoint** held-out tail of up to
+/// Split `rows` into `(train, valid)` with a disjoint held-out tail of up to
 /// `max_valid` rows, capped at a fifth so a tiny run keeps a trainable majority.
 pub fn split_valid<T>(mut rows: Vec<T>, max_valid: usize) -> (Vec<T>, Vec<T>) {
     let n_valid = max_valid.min(rows.len() / 5);
@@ -111,7 +100,6 @@ pub fn split_valid<T>(mut rows: Vec<T>, max_valid: usize) -> (Vec<T>, Vec<T>) {
 }
 
 /// A training batch: `inputs` and next-token `targets`, both `[batch, seq_len]`.
-/// Shared by the pretraining and SFT batchers.
 #[derive(Clone, Debug)]
 pub struct Batch<B: Backend> {
     pub inputs: Tensor<B, 2, Int>,
@@ -119,7 +107,7 @@ pub struct Batch<B: Backend> {
 }
 
 // ===========================================================================
-// Pretraining: streaming, seekable corpus
+// Pretraining using a streaming, seekable corpus
 // ===========================================================================
 
 /// One row group's contiguous block of dense windows in the flattened global window
@@ -133,7 +121,7 @@ struct GroupWindows {
 }
 
 /// Dense windows a group yields from `n_tokens`: `floor(n_tokens / (seq_len+1))`. The
-/// remainder (< seq_len+1 tokens) is dropped. Pure/testable.
+/// remainder (< seq_len+1 tokens) is dropped.
 fn group_window_count(n_tokens: usize, seq_len: usize) -> usize {
     n_tokens / (seq_len + 1)
 }
@@ -164,7 +152,7 @@ fn build_window_index(
 
 /// Resolve a global window index to `(group-descriptor index, local window in group)`,
 /// or `None` if out of range. Binary search over the contiguous window blocks;
-/// zero-window groups are empty ranges and are correctly skipped. Pure/testable.
+/// zero-window groups are empty ranges and are correctly skipped.
 fn resolve_window(index: &[GroupWindows], gw: usize) -> Option<(usize, usize)> {
     let i = index
         .binary_search_by(|g| {
@@ -180,20 +168,18 @@ fn resolve_window(index: &[GroupWindows], gw: usize) -> Option<(usize, usize)> {
     Some((i, gw - index[i].win_start))
 }
 
-/// A source of documents addressable by row group — the parquet reader implements it;
-/// tests use an in-memory fake. `Send + Sync` so the dataset works under multi-worker
-/// dataloaders.
+/// A source of documents addressable by row group.
 pub trait RowGroupSource: Send + Sync {
-    /// Number of row groups (defines the index; read from metadata only).
+    /// Number of row groups.
     fn num_groups(&self) -> usize;
-    /// The `text` of every document in row group `g` (the only point that reads data).
+    /// The `text` of every document in row group `g`.
     fn group_texts(&self, g: usize) -> Result<Vec<String>>;
 }
 
 /// A FineWeb-style parquet shard. Construction reads only the footer (column index +
 /// row-group count); `group_texts` reopens the file to read a single row group, so the
 /// struct stays `Send + Sync` and holds no live reader. Misses pay one footer read plus
-/// the (cheap) tokenize — never the whole shard in RAM.
+/// the tokenize.
 pub struct ParquetShard {
     path: PathBuf,
     text_idx: usize,
@@ -201,8 +187,7 @@ pub struct ParquetShard {
 }
 
 impl ParquetShard {
-    /// Open a local parquet file and read its metadata, reading documents from the column
-    /// named `text_column` (FineWeb/FineMath use `text`; another corpus may differ).
+    /// Open a local parquet file and read its metadata, reading documents from the column.
     pub fn open(path: PathBuf, text_column: &str) -> Result<Self> {
         let file = File::open(&path).wrap_err("opening parquet shard")?;
         let reader = SerializedFileReader::new(file).wrap_err("opening parquet reader")?;
@@ -256,8 +241,8 @@ impl RowGroupSource for ParquetShard {
     }
 }
 
-/// Blobs fetched per `group_texts` call (one HTTP GET each, run in parallel). Also the
-/// granularity of the row-group cache, so a miss re-fetches at most this many files.
+/// Blobs fetched per `group_texts` call. Also the granularity of the row-group cache,
+/// so a miss re-fetches at most this many files.
 const SWH_GROUP_SIZE: usize = 256;
 
 /// A code corpus whose parquet ships **Software-Heritage IDs**, not text (e.g. Stack-Edu):
@@ -312,7 +297,7 @@ impl SoftwareHeritageSource {
 /// Max blob fetches in flight at once against Software Heritage's S3.
 const SWH_CONCURRENCY: usize = 32;
 
-/// Process-wide async HTTP client (connection-pooled) for the SWH fetches, built once.
+/// Process-wide async HTTP client for the SWH fetches, built once.
 fn swh_client() -> Result<&'static reqwest::Client> {
     static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
     if let Some(client) = CLIENT.get() {
@@ -325,9 +310,8 @@ fn swh_client() -> Result<&'static reqwest::Client> {
 }
 
 /// Process-wide runtime that drives the async fetches. The streaming dataset's
-/// `group_texts` is a synchronous call (from the count pass and from dataloader worker
-/// threads), so it `block_on`s this runtime; the threads are never themselves inside a
-/// runtime, so blocking on it is safe.
+/// `group_texts` is a synchronous call, so it `block_on`s this runtime; the
+/// threads are never themselves inside a runtime, so blocking on it is safe.
 fn swh_runtime() -> Result<&'static tokio::runtime::Runtime> {
     static RT: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
     if let Some(rt) = RT.get() {
@@ -343,9 +327,10 @@ fn swh_runtime() -> Result<&'static tokio::runtime::Runtime> {
 
 /// Fetch one blob's content from Software Heritage's public S3 bucket and gunzip it.
 /// Objects are stored gzipped and served as `application/octet-stream` with no
-/// `Content-Encoding`, so the body is the raw gzip stream (decoded here). Bytes are
-/// decoded lossily — Stack-Edu spans many source encodings and the byte-level BPE
-/// tokenizer is encoding-agnostic anyway.
+/// `Content-Encoding`, so the body is the raw gzip stream.
+///
+/// TODO: Bytes are decoded lossily because Stack-Edu spans many source encodings
+///       likely should convert to utf-8.
 async fn fetch_one(client: &reqwest::Client, blob_id: &str) -> Result<String> {
     let url = format!("https://softwareheritage.s3.amazonaws.com/content/{blob_id}");
     let gz = client
@@ -364,9 +349,7 @@ async fn fetch_one(client: &reqwest::Client, blob_id: &str) -> Result<String> {
     Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
-/// Fetch `blob_ids` concurrently (≤ `SWH_CONCURRENCY` in flight), preserving input order
-/// — the count pass and the load path concatenate a group's docs, so the order must be
-/// deterministic. A failed fetch becomes an empty document (no tokens) rather than fatal.
+/// Fetch `blob_ids` concurrently (≤ `SWH_CONCURRENCY` in flight), preserving input order.
 fn fetch_swh_blobs(blob_ids: &[String]) -> Result<Vec<String>> {
     let client = swh_client()?;
     let out = swh_runtime()?.block_on(async move {
@@ -407,7 +390,7 @@ impl RowGroupSource for SoftwareHeritageSource {
             return Ok(Vec::new());
         }
         // One HTTP GET per blob, fetched concurrently; a failed fetch becomes an empty
-        // document (contributes no tokens to the dense packing) instead of failing the run.
+        // document instead of failing the run.
         fetch_swh_blobs(&self.blob_ids[start..end])
     }
 }
@@ -463,8 +446,10 @@ impl StreamingTokenDataset {
         })
     }
 
-    /// Fetch + open the listed shards from `repo` at git `revision` (reading documents
-    /// from `text_column`) and build the dataset.
+    /// Fetches and open the listed shards from `repo` at git `revision` to
+    /// build the dataset.
+    ///
+    /// TODO: DRY this with the N other implementations
     pub fn from_hub(
         tokenizer: Arc<fastokens::Tokenizer>,
         repo: &str,
@@ -495,7 +480,7 @@ impl StreamingTokenDataset {
     }
 
     /// A sub-range view exposing global windows `range` as local indices, sharing the
-    /// same sources and cache. Used to split disjoint train/valid sets.
+    /// same sources and cache.
     pub fn view(&self, range: std::ops::Range<usize>) -> Self {
         let mut v = self.clone();
         v.offset = range.start;
@@ -503,7 +488,7 @@ impl StreamingTokenDataset {
         v
     }
 
-    /// Tokenize + concatenate one row group into its dense token stream (miss path).
+    /// Tokenize and concatenate one row group into its dense token stream.
     fn load_group(&self, group_idx: usize) -> Result<Arc<Vec<u32>>> {
         let gw = self.index[group_idx];
         let texts = self.sources[gw.source].group_texts(gw.group)?;
@@ -526,7 +511,7 @@ impl Dataset<Vec<i64>> for StreamingTokenDataset {
         }
         let (group_idx, local) = resolve_window(&self.index, self.offset + index)?;
         // Cache hit → clone the Arc'd token stream; miss → tokenize once and insert. A
-        // read error (corrupt shard) logs and drops the item rather than killing the run.
+        // read error logs and drops the item rather than killing the run.
         let stream = self
             .cache
             .try_get_with(group_idx as u64, || self.load_group(group_idx))
@@ -534,9 +519,7 @@ impl Dataset<Vec<i64>> for StreamingTokenDataset {
             .ok()?;
         // Dense window `local`: tokens [local*w .. local*w + w). The window index is sized
         // from the count pass; a non-deterministic source can reload a *shorter* stream than
-        // it counted (an SWH blob fetch that succeeded while counting fails on reload → empty
-        // doc → fewer tokens), so a promised window may not fit. Drop it rather than panic,
-        // like the cache-error path above.
+        // it counted, so a promised window may not fit. Drop it rather than panic.
         let w = self.seq_len + 1;
         let start = local * w;
         stream
@@ -552,8 +535,8 @@ impl Dataset<Vec<i64>> for StreamingTokenDataset {
 // --- Multi-stage data mix (decay anneal) ---
 //
 // Vary the domain mix over training instead of one static blend: web-heavy early, then
-// upweight math/code over the cosine-LR decay tail (SmolLM3's multi-stage recipe). The
-// mechanism is a `MixtureDataset` wrapping one `StreamingTokenDataset` per domain plus a
+// upweight math/code over the cosine-LR decay tail, following SmolLM3's multi-stage recipe.
+// The mechanism is a `MixtureDataset` wrapping one `StreamingTokenDataset` per domain plus a
 // shared atomic counter of items drawn; each `get` reads the current progress fraction,
 // interpolates the domain weights for it, picks a domain, and draws a window from it.
 // This composes with `SamplerDataset` + Burn's `SupervisedTraining` (which owns the epoch
@@ -561,6 +544,8 @@ impl Dataset<Vec<i64>> for StreamingTokenDataset {
 // little ahead, and a resume restarts the counter — but the ramp is coarse, so neither
 // matters. The held-out valid set stays a single fixed domain (see `pretrain`) so the
 // metric is comparable across the run.
+
+// TODO: Just use fastrand
 
 /// SplitMix64: turn the (already-random) sampler index into two independent uniform
 /// streams — one to pick the domain, one to pick a window within it.
@@ -572,7 +557,7 @@ fn splitmix64(mut x: u64) -> u64 {
     z ^ (z >> 31)
 }
 
-/// Pick an index in `0..weights.len()` by the (unnormalized) `weights`, using a uniform
+/// Pick an index in `0..weights.len()` by the unnormalized `weights`, using a uniform
 /// `u ∈ [0,1)`. Empty/zero weights resolve to domain 0.
 fn pick_domain(weights: &[f64], u: f64) -> usize {
     let total: f64 = weights.iter().sum();
@@ -632,17 +617,13 @@ impl MixSchedule {
     }
 }
 
-/// A progress-weighted mixture over per-domain streaming corpora. Cheap to clone — clones
-/// share the same domains and the same progress counter (so multi-worker dataloaders
-/// advance one shared progress).
+/// A progress-weighted mixture over per-domain streaming corpora.
 #[derive(Clone)]
 pub struct MixtureDataset {
     domains: Vec<StreamingTokenDataset>,
     schedule: MixSchedule,
     consumed: Arc<AtomicU64>,
-    /// Planned total items drawn across the run (denominator for progress).
     total: u64,
-    /// Sum of domain window counts — the index range exposed to the sampler.
     len: usize,
 }
 
@@ -707,10 +688,10 @@ impl<B: Backend> Batcher<B, Vec<i64>, Batch<B>> for TokenBatcher {
 // SFT: instruction tuning
 // ===========================================================================
 
-/// Load SFT `(prompt, response)` pairs from the OpenAssistant oasst_top1 parquet
-/// (human-written, Apache-2.0). Each row's `text` is an already-ChatML thread
-/// (`<|im_start|>user…<|im_end|>…<|im_start|>assistant…`); we take the **first**
-/// user→assistant exchange (single-turn is plenty at this scale).
+/// Load SFT `(prompt, response)` pairs from the OpenAssistant oasst_top1 parquet. Each
+/// row's `text` is an already-ChatML thread (`<|im_start|>user…<|im_end|>…<|im_start|>assistant…`);i
+///
+/// TODO: Adapt pairs to our chat tags and load all pairs that would fit within the sequence.
 pub fn load_sft_pairs(repo: &str, file: &str, max: usize) -> Result<Vec<(String, String)>> {
     let reader = open_hub_dataset_parquet(repo, file)?;
     let text = column_index(&reader, "text")?;
@@ -722,11 +703,15 @@ pub fn load_sft_pairs(repo: &str, file: &str, max: usize) -> Result<Vec<(String,
 
 /// Extract the first `(user, assistant)` exchange from an oasst_top1 `text` thread —
 /// already ChatML (`<|im_start|>user\n…<|im_end|>…<|im_start|>assistant\n…`).
+///
+/// TODO: Adapt pairs to our chat tags and load all pairs that would fit within the sequence.
 fn oasst_first_pair(text: &str) -> Option<(String, String)> {
     let user = chatml_turn(text, "<|im_start|>user\n")?;
     let assistant = chatml_turn(text, "<|im_start|>assistant\n")?;
     (!user.is_empty() && !assistant.is_empty()).then_some((user, assistant))
 }
+
+// TODO: Adapt to our chat template.
 
 /// Content of the first turn opened by `open`, up to its `<|im_end|>`.
 fn chatml_turn(text: &str, open: &str) -> Option<String> {
@@ -771,8 +756,7 @@ pub fn build_sft_row(
     Ok((inputs, targets))
 }
 
-/// Pre-tokenized SFT rows; the trivial batcher just stacks them (tokenization happens
-/// once up front, so this stays `Send + Sync` for the dataloader).
+/// Pre-tokenized SFT rows.
 #[derive(Clone)]
 pub struct SftDataset {
     rows: Vec<(Vec<i64>, Vec<i64>)>,
@@ -836,9 +820,7 @@ pub fn load_dpo_triples(
 }
 
 /// One DPO example: response-masked `(input, target)` rows for the chosen and rejected
-/// continuations. The frozen-reference log-probs are computed inline in the train step,
-/// not precomputed — at 1-2 epochs a cache costs a full upfront reference pass for no
-/// saving.
+/// continuations.
 #[derive(Clone, Debug)]
 pub struct DpoExample {
     pub chosen: (Vec<i64>, Vec<i64>),
@@ -866,7 +848,7 @@ impl Dataset<DpoExample> for DpoDataset {
 }
 
 /// A DPO batch: chosen/rejected response-masked sequences `[B, L]`. The reference
-/// log-probs are computed inside the train step (see `dpo::DpoModel`), not carried here.
+/// log-probs are computed inside the train step, not carried here.
 #[derive(Clone, Debug)]
 pub struct DpoBatch<B: Backend> {
     pub chosen_in: Tensor<B, 2, Int>,
@@ -922,7 +904,7 @@ pub fn load_gsm8k(repo: &str, file: &str, max: usize) -> Result<Vec<(String, Str
     })
 }
 
-/// One GRPO example: a tokenized prompt and its verifiable (integer) answer.
+/// One GRPO example: a tokenized prompt and its verifiable answer.
 #[derive(Clone, Debug)]
 pub struct GrpoExample {
     pub prompt: Vec<i64>,
@@ -990,8 +972,6 @@ impl<B: Backend> Batcher<B, GrpoExample, GrpoBatch> for GrpoBatcher {
 mod tests {
     use super::*;
 
-    /// A small committed byte-level BPE for hermetic tests — no network, no training.
-    /// Generated once by `train tokenizer --vocab-size 512` (see `testdata/tokenizer.json`).
     fn fixture_tokenizer() -> fastokens::Tokenizer {
         let json = serde_json::from_str(include_str!("../testdata/tokenizer.json"))
             .expect("fixture tokenizer json");

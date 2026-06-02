@@ -1,6 +1,12 @@
-//! SFT stage: instruction-tune the pretrained model with a ChatML template and
-//! response-masked loss with a low constant learning rate.
+//! SFT (Supervised Fine Tuning)
+//!
+//! Instruction-tune the pretrained model with the template and response-masked
+//! loss with a low constant learning rate.
 
+use crate::config::ModelConfig;
+use crate::constants::{NUM_WORKERS, SFT_FILE, SFT_REPO, SFT_SEQ_LEN, SHUFFLE_SEED};
+use crate::data::{SftBatcher, SftDataset, build_sft_row, load_sft_pairs, split_valid};
+use crate::train::TrainingContext;
 use burn::config::Config;
 use burn::data::dataloader::DataLoaderBuilder;
 use burn::data::dataset::transform::SamplerDataset;
@@ -9,11 +15,6 @@ use burn::record::CompactRecorder;
 use burn::train::metric::LossMetric;
 use burn::train::{Learner, SupervisedTraining};
 use eyre::{Result, WrapErr};
-
-use crate::config::ModelConfig;
-use crate::constants::{NUM_WORKERS, SFT_FILE, SFT_REPO, SFT_SEQ_LEN, SHUFFLE_SEED};
-use crate::data::{SftBatcher, SftDataset, build_sft_row, load_sft_pairs, split_valid};
-use crate::train::TrainingContext;
 
 const BATCH_SIZE: usize = 8;
 const VALID_ROWS: usize = 64;
@@ -36,7 +37,7 @@ pub fn run(
 
     let pairs = load_sft_pairs(SFT_REPO, SFT_FILE, max_examples)?;
 
-    // Tokenize + response-mask each pair.
+    // Tokenize and response-mask each pair.
     let rows: Vec<_> = pairs
         .iter()
         .map(|(p, r)| build_sft_row(&ctx.tokenizer, p, r, SFT_SEQ_LEN))
@@ -44,7 +45,7 @@ pub fn run(
 
     let (rows, valid_rows) = split_valid(rows, VALID_ROWS);
 
-    // Slice into shared 1000-step checkpoint-epochs with auto-resume (see grpo/pretrain).
+    // Slice into shared  checkpoint-epochs with auto-resume.
     let sched = crate::train::schedule(rows.len(), BATCH_SIZE, epochs);
 
     println!(

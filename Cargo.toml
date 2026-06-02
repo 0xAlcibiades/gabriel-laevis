@@ -12,6 +12,8 @@ cuda = ["burn/cuda", "burn/autotune", "burn/fusion", "burn/train"]
 bf16 = []
 checkpoint = []
 
+# TODO: Training vs inference dependency partition for lighter inference
+
 [dependencies]
 async-stream = "0.3"
 axum = "0.8"

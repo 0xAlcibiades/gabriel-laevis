@@ -1,7 +1,5 @@
 //! OpenAI-compatible inference server. See `serve --help`.
 
-use std::sync::Arc;
-
 use axum::extract::State;
 use axum::response::sse::{Event, Sse};
 use axum::response::{IntoResponse, Response};
@@ -13,15 +11,15 @@ use burn::record::CompactRecorder;
 use clap::Parser;
 use eyre::{Result, WrapErr};
 use fastokens::DecodeStream;
-use kanal::AsyncReceiver;
-use serde::Deserialize;
-use serde_json::json;
-
 use gabriel_laevis_0::Compute;
 use gabriel_laevis_0::config::{ModelConfig, artifact_dir};
 use gabriel_laevis_0::data::load_tokenizer;
 use gabriel_laevis_0::model::GabrielLaevis;
 use gabriel_laevis_0::model::lm::Sampling;
+use kanal::AsyncReceiver;
+use serde::Deserialize;
+use serde_json::json;
+use std::sync::Arc;
 
 type Device = burn::tensor::Device<Compute>;
 

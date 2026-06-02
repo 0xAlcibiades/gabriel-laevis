@@ -1,6 +1,6 @@
 #![doc = include_str!("../README.md")]
 // Required by Burn's wgpu/cubecl backend: its deeply nested associated types
-// exceed the default recursion limit (128) during trait resolution.
+// exceed the default recursion limit during trait resolution.
 #![recursion_limit = "256"]
 
 pub mod chat;
@@ -9,6 +9,9 @@ pub mod constants;
 pub mod data;
 pub mod model;
 pub mod train;
+
+// TODO: This is somewhat of a mess, we don't need to case, we could let
+// burn handle this for us and simplify the crate structure drastically.
 
 // Float element: bf16 (feature) or f32. The whole model — scan included — runs in
 // `Elem`; there is no internal f32 cast. bf16 is fine for the scan: it has the same
@@ -43,11 +46,11 @@ pub type Compute = burn::backend::Wgpu<Elem>;
 ))]
 pub type Compute = burn::backend::NdArray<Elem>;
 
+// TODO: Same story here, we can just re-expose the flags.
+
 // Autodiff wrapper. `checkpoint` opts into Burn's BalancedCheckpointing strategy —
 // recompute cheap (elementwise) ops in backward instead of storing them, trading a
-// little compute for activation memory. Off by default: it's near a wash at the
-// laevis tier (the head logits, not activations, dominate memory), but a real lever
-// once memory-bound at larger sizes / long context. See README.
+// little compute for activation memory. Off by default
 #[cfg(not(feature = "checkpoint"))]
 pub type Train = burn::backend::Autodiff<Compute>;
 #[cfg(feature = "checkpoint")]

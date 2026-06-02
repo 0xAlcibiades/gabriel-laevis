@@ -1,6 +1,7 @@
 //! Tokenizer training
 //!
-//! Trains a custom BPE tokenizer that is right sized on the actual pretraining dataset.
+//! Trains a custom BPE tokenizer that is right-sized for the model on the actual
+//! pretraining dataset.
 //!
 //! Refs:
 //!
@@ -13,10 +14,11 @@
 //! Emits a HuggingFace `tokenizer.json` with `pre_tokenizer = Sequence([Split, ByteLevel])`,
 //! the exact shape `fastokens` fuses into its fast path at inference.
 
-use std::path::{Path, PathBuf};
-
+use crate::config;
+use crate::constants::FINEWEB_REPO;
+use crate::data::{ParquetShard, RowGroupSource, SoftwareHeritageSource};
 use eyre::{Result, WrapErr};
-
+use std::path::{Path, PathBuf};
 use tokenizers::AddedToken;
 use tokenizers::Tokenizer;
 use tokenizers::decoders::byte_level::ByteLevel as ByteLevelDecoder;
@@ -27,28 +29,22 @@ use tokenizers::pre_tokenizers::sequence::Sequence;
 use tokenizers::pre_tokenizers::split::{Split, SplitPattern};
 use tokenizers::tokenizer::SplitDelimiterBehavior;
 
-use crate::config;
-use crate::constants::FINEWEB_REPO;
-use crate::data::{ParquetShard, RowGroupSource, SoftwareHeritageSource};
-
-/// GPT-4 split pattern, with `\p{N}{1,2}` (digit grouping tuned for a small vocab, per
-/// nanochat — `{1,3}` is wasteful in token-space at this scale).
+/// GPT-4 like split pattern, with `\p{N}{1,2}` with digit grouping tuned for a small vocab,
+/// per nanochat — `{1,3}` would be wasteful in token-space at smaller scales.
 const SPLIT_PATTERN: &str = r"'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?+\p{L}+|\p{N}{1,2}| ?[^\s\p{L}\p{N}]++[\r\n]*|\s*[\r\n]|\s+(?!\S)|\s+";
 
-/// Reserved special tokens. Order fixes their ids: `<pad>` is first so it lands at
-/// id 0 = `chat::IGNORE_ID`. Most are reserved for capabilities
-/// we'll render later (tool-calling, image/audio/video); only the turn + thinking tokens
-/// are emitted today (see `chat.rs`). Reserving them now is what makes adding those later
-/// not require another from-scratch re-pretrain.
+/// Reserved special tokens.
 const SPECIAL_TOKENS: &[&str] = &[
-    // Core (pad must stay first → id 0).
+    // Core
+    //
+    // <pad> must stay first so it lands at id 0 = `chat::IGNORE_ID`.
     "<pad>",
     "<bos>",
     "<eos>",
     // Turns.
     "<|turn>",
     "<turn|>",
-    // Reasoning / thinking.
+    // Reasoning and thinking.
     "<|think|>",
     "<|channel>",
     "<channel|>",
@@ -74,11 +70,12 @@ const SPECIAL_TOKENS: &[&str] = &[
 ];
 
 /// Train a byte-level BPE on the pretraining mix and save it as `tokenizer.json`.
+///
 /// `out` defaults to `$MODEL_DIR/tokenizer.json`.
 pub fn run(vocab_size: usize, docs_per_domain: usize, out: Option<PathBuf>) -> Result<()> {
     let rc = config::run();
 
-    // --- Gather a text sample from the same sources pretraining uses ---
+    // Gather a text sample from the same sources pretraining uses
     let mut texts: Vec<String> = Vec::new();
 
     println!("sampling web (FineWeb) up to {docs_per_domain} docs...");
@@ -116,7 +113,7 @@ pub fn run(vocab_size: usize, docs_per_domain: usize, out: Option<PathBuf>) -> R
         texts.len()
     );
 
-    // --- Configure a GPT-4-style byte-level BPE ---
+    // Configure a byte-level BPE
     let bpe = BPE::builder()
         .byte_fallback(true)
         .build()
@@ -129,8 +126,9 @@ pub fn run(vocab_size: usize, docs_per_domain: usize, out: Option<PathBuf>) -> R
         false,
     )
     .map_err(|e| eyre::eyre!("building split pre-tokenizer: {e}"))?;
-    // ByteLevel::new(add_prefix_space, trim_offsets, use_regex). use_regex=false → "bulk"
-    // mode, which fastokens detects to fuse byte-level into BPE.
+    // ByteLevel::new(add_prefix_space, trim_offsets, use_regex).
+    // use_regex=false → "bulk" mode, which fastokens detects to fuse
+    // byte-level into BPE.
     let byte_level = ByteLevel::new(false, true, false);
     let pre = Sequence::new(vec![split.into(), byte_level.into()]);
     tokenizer.with_pre_tokenizer(Some(pre));
@@ -139,7 +137,8 @@ pub fn run(vocab_size: usize, docs_per_domain: usize, out: Option<PathBuf>) -> R
     let bpe_trainer = BpeTrainer::builder()
         .vocab_size(vocab_size)
         .min_frequency(0)
-        // `initial_alphabet` wants a std `HashSet`; `ByteLevel::alphabet()` is an ahash set.
+        // `initial_alphabet` wants a std `HashSet`;
+        // `ByteLevel::alphabet()` is an ahash set.
         .initial_alphabet(
             ByteLevel::alphabet()
                 .into_iter()
@@ -175,6 +174,9 @@ pub fn run(vocab_size: usize, docs_per_domain: usize, out: Option<PathBuf>) -> R
     verify(&out)?;
     Ok(())
 }
+
+// TODO: These are all duplicate and should live authoritatively in data.rs combining
+// all data retreival functions across every phase of training.
 
 /// Pull up to `max_docs` documents from `text_column` across `shards` of a HF parquet.
 fn gather_parquet(
@@ -237,9 +239,9 @@ fn gather_swh(out: &mut Vec<String>, rc: &config::RunConfig, max_docs: usize) ->
     Ok(())
 }
 
-/// Self-check: load the saved tokenizer through the *inference* runtime (fastokens) and
-/// confirm it (a) loads, (b) round-trips, and (c) encodes a control byte the old SmolLM2
-/// vocab choked on (`0x06`) — the regression that motivated this tokenizer training.
+/// Loads the saved tokenizer through the inference runtime and confirms
+///
+/// it (a) loads, (b) round-trips, and (c) encodes a control byte
 fn verify(path: &Path) -> Result<()> {
     let tok = fastokens::Tokenizer::from_file(path).wrap_err("fastokens loading the result")?;
 

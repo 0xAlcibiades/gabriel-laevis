@@ -1,12 +1,11 @@
 //! Shared context every training stage needs.
 
+use crate::config::ModelConfig;
+use crate::model::GabrielLaevis;
 use burn::module::Module;
 use burn::record::CompactRecorder;
 use eyre::{Result, WrapErr};
 use std::path::{Path, PathBuf};
-
-use crate::config::ModelConfig;
-use crate::model::GabrielLaevis;
 
 /// The compute device type.
 pub type Device = burn::tensor::Device<crate::Compute>;
@@ -18,15 +17,14 @@ pub struct TrainingContext {
 }
 
 impl TrainingContext {
-    /// Ensure the artifact directory exists, then load the tokenizer. Order matters:
-    /// the dir must exist first so a freshly fetched tokenizer can be packaged into it.
+    /// Ensure the artifact directory exists, then load the tokenizer.
     pub fn new() -> Result<Self> {
         let artifact = crate::config::artifact_dir();
 
         std::fs::create_dir_all(&artifact)
             .wrap_err_with(|| format!("creating artifact dir {}", artifact.display()))?;
 
-        let tokenizer = crate::data::load_tokenizer().wrap_err("loading tokenizer")?;
+        let tokenizer = crate::data::load_tokenizer().wrap_err("could not load tokenizer")?;
 
         Ok(Self {
             device: Default::default(),
@@ -44,13 +42,12 @@ impl TrainingContext {
         self.artifact.join(name)
     }
 
-    /// Whether a named checkpoint exists. `CompactRecorder` writes `<name>.mpk`.
+    /// Whether a named checkpoint exists.
     pub fn has_checkpoint(&self, name: &str) -> bool {
         self.checkpoint_path(name).with_extension("mpk").exists()
     }
 
-    /// Latest epoch with a saved checkpoint under `${MODEL_DIR}/checkpoint/`,
-    /// or None if there's nothing to resume from.
+    /// Latest epoch with a saved checkpoint or None if there's nothing to resume from.
     pub fn latest_checkpoint_epoch(&self, dir: impl AsRef<Path>) -> Option<usize> {
         let cp = dir.as_ref().join("checkpoint");
         std::fs::read_dir(cp)
@@ -65,13 +62,12 @@ impl TrainingContext {
             .max()
     }
 
-    /// A fresh model on the autodiff (training) backend.
+    /// A fresh model on the autodiff backend.
     pub fn fresh_model(&self, cfg: &ModelConfig) -> GabrielLaevis<crate::Train> {
         GabrielLaevis::new(cfg, &self.device)
     }
 
-    /// Load a checkpoint onto the autodiff backend (e.g. to continue from a
-    /// prior stage's output).
+    /// Load a checkpoint onto the autodiff backend.
     pub fn load_model(&self, cfg: &ModelConfig, name: &str) -> Result<GabrielLaevis<crate::Train>> {
         GabrielLaevis::new(cfg, &self.device)
             .load_file(
