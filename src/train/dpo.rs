@@ -1,17 +1,20 @@
 //! DPO (Direct Preference Optimization) stage.
 //!
-//! The policy is initialised from the SFT checkpoint and optimised to raise the
-//! implicit reward margin against a frozen reference (also the SFT model). The
-//! reference forward is run **inline** in the train step and detached — no separate
-//! precompute pass. (A cache only pays off past a couple of epochs; at 1-2 epochs it
-//! costs a full upfront reference pass over the whole dataset for nothing. GRPO scores
-//! its reference the same way.)
+//! The policy is initialised from the checkpoint and optimised to raise the implicit
+//! reward margin against a frozen reference. The reference forward is run **inline**
+//! in the train step and detached
 //!
 //!    loss = -log σ(β·((logπ_c - logπ_r) - (logref_c - logref_r)))
 //!         = softplus(-β·((logπ_c - logπ_r) - (logref_c - logref_r)))
-//!
-//! Run `train sft` first to produce `model_sft` + `config.json`.
 
+use crate::config::ModelConfig;
+use crate::constants::{DPO_BETA, DPO_FILE, DPO_REPO, DPO_SEQ_LEN, NUM_WORKERS, SHUFFLE_SEED};
+use crate::data::{
+    DpoBatch, DpoBatcher, DpoDataset, DpoExample, build_sft_row, load_dpo_triples, split_valid,
+};
+use crate::model::GabrielLaevis;
+use crate::model::lm::sequence_logprob;
+use crate::train::TrainingContext;
 use burn::config::Config;
 use burn::data::dataloader::DataLoaderBuilder;
 use burn::data::dataset::transform::SamplerDataset;
@@ -27,26 +30,11 @@ use burn::train::{
 };
 use eyre::{Result, WrapErr};
 
-use crate::config::ModelConfig;
-use crate::constants::{DPO_BETA, DPO_FILE, DPO_REPO, DPO_SEQ_LEN, NUM_WORKERS, SHUFFLE_SEED};
-use crate::data::{
-    DpoBatch, DpoBatcher, DpoDataset, DpoExample, build_sft_row, load_dpo_triples, split_valid,
-};
-use crate::model::GabrielLaevis;
-use crate::model::lm::sequence_logprob;
-use crate::train::TrainingContext;
-
-// DPO retains two policy autograd graphs per step (chosen + rejected) vs SFT's one,
-// so batch 4 here ≈ SFT's batch 8 in retained-activation terms. The reference runs on
-// the inner backend (graph-free, freed each step), so it only peaks transiently.
 const BATCH_SIZE: usize = 4;
 const VALID_EXAMPLES: usize = 64;
 const LR: f64 = 5.0e-7;
 
-/// Policy + frozen reference. In the train step the policy runs on the autodiff
-/// backend and the reference on the **inner** backend (graph-free), so the reference
-/// contributes no gradient and — crucially — retains no autograd graph. Mirrors
-/// `grpo::GrpoModel`.
+/// Policy and frozen reference model.
 #[derive(Module, Debug)]
 pub struct DpoModel<B: Backend> {
     policy: GabrielLaevis<B>,
@@ -54,8 +42,8 @@ pub struct DpoModel<B: Backend> {
 }
 
 impl<B: Backend> DpoModel<B> {
-    /// Build the DPO loss + reward-accuracy output from policy and reference
-    /// per-sequence logprobs (all on backend `B`).
+    /// Builds the DPO loss and reward-accuracy output from policy
+    /// and reference per-sequence logprobs.
     fn assemble(
         pi_c: Tensor<B, 1>,
         pi_r: Tensor<B, 1>,
@@ -69,7 +57,7 @@ impl<B: Backend> DpoModel<B> {
         let loss = activation::softplus(-margin.clone(), 1.0).mean();
 
         // Frame as binary "is chosen preferred": logits [0, margin], target = 1, so
-        // accuracy = fraction with margin > 0 (the DPO reward accuracy).
+        // accuracy = fraction with margin > 0.
         let device = margin.device();
         let margin_col = margin.unsqueeze_dim(1); // [B, 1]
 
@@ -81,8 +69,10 @@ impl<B: Backend> DpoModel<B> {
         ClassificationOutput::new(loss, logits, targets)
     }
 
-    /// Validation forward: the whole model is already on the inner (non-autodiff)
-    /// backend, so every forward is graph-free. Policy and reference both run plainly.
+    /// Evaluates the output
+    ///
+    /// The whole model is already on the non-autodiff backend, so every
+    /// forward is graph-free. Policy and reference both run plainly.
     fn output_eval(&self, batch: DpoBatch<B>) -> ClassificationOutput<B> {
         let pi_c = sequence_logprob(
             self.policy.forward(batch.chosen_in.clone()),
@@ -102,8 +92,10 @@ impl<B: Backend> DpoModel<B> {
 }
 
 impl<B: AutodiffBackend> DpoModel<B> {
-    /// Training forward. The policy runs on the autodiff backend (gradient flows); the
-    /// frozen reference runs on the INNER backend via `.valid()`, building **no** graph.
+    /// Training forward.
+    ///
+    /// The policy runs on the autodiff backend (gradient flows); the frozen
+    /// reference runs on the inner backend via `.valid()`.
     ///
     /// Why not autodiff + `.detach()`: detach only severs the *output* — the reference's
     /// full graph (every activation, the `[B,T,vocab]` logits) is still built, and since
@@ -164,31 +156,26 @@ pub fn run(
         .wrap_err("loading config (run `train sft` first)")?;
     cfg.validate()?;
 
-    // Reference and policy both initialise from this base (the SFT model by default).
+    // Reference and policy both initialise from this base.
     let base = from.unwrap_or("model_sft");
 
-    println!("loading {DPO_REPO} (up to {max_examples} pairs)...");
+    println!("loading {DPO_REPO} up to {max_examples} pairs...");
     let triples =
         load_dpo_triples(DPO_REPO, DPO_FILE, max_examples).wrap_err("loading dpo data")?;
-    println!("tokenizing + scoring {} preference pairs...", triples.len());
+    println!(
+        "tokenizing and scoring {} preference pairs...",
+        triples.len()
+    );
 
-    let total = triples.len();
-
-    // Build chosen+rejected together per triple into one DpoExample, dropping the whole
-    // triple if either side has a byte the frozen-vocab tokenizer can't encode — so the
-    // two sides stay paired, and unencodable data is skipped instead of aborting.
+    // Build chosen + rejected response-masked rows together per triple.
     let examples: Vec<DpoExample> = triples
         .into_iter()
-        .filter_map(|(p, c, r)| {
-            let chosen = build_sft_row(&ctx.tokenizer, &p, &c, DPO_SEQ_LEN).ok()?;
-            let rejected = build_sft_row(&ctx.tokenizer, &p, &r, DPO_SEQ_LEN).ok()?;
-            Some(DpoExample { chosen, rejected })
+        .map(|(p, c, r)| {
+            let chosen = build_sft_row(&ctx.tokenizer, &p, &c, DPO_SEQ_LEN)?;
+            let rejected = build_sft_row(&ctx.tokenizer, &p, &r, DPO_SEQ_LEN)?;
+            Ok(DpoExample { chosen, rejected })
         })
-        .collect();
-
-    if examples.len() < total {
-        println!("skipped {} unencodable pairs", total - examples.len());
-    }
+        .collect::<Result<_>>()?;
 
     let (examples, valid_examples) = split_valid(examples, VALID_EXAMPLES);
 
@@ -201,7 +188,7 @@ pub fn run(
                 &CompactRecorder::new(),
                 &ctx.device,
             )
-            .wrap_err_with(|| format!("loading {base} as {what} (run `train sft` first)"))
+            .wrap_err_with(|| format!("loading {base} as {what}"))
     };
 
     let model = DpoModel {
@@ -212,7 +199,7 @@ pub fn run(
     // Slice into shared 1000-step checkpoint-epochs with auto-resume (see grpo/pretrain).
     let sched = crate::train::schedule(examples.len(), BATCH_SIZE, epochs);
     println!(
-        "training {} steps (~{epochs} passes over {} pairs) as {} x {}-step checkpoints",
+        "training {} steps in ~{epochs} passes over {} pairs as {} x {}-step checkpoints",
         sched.total_steps,
         examples.len(),
         sched.ckpt_epochs,
@@ -243,12 +230,12 @@ pub fn run(
         .num_epochs(sched.ckpt_epochs)
         .summary();
 
-    let training = match (from, ctx.latest_checkpoint_epoch(&dpo_dir)) {
-        (Some(_), _) | (None, None) => training,
-        (None, Some(e)) => {
+    let training = match ctx.resume_epoch(from, &dpo_dir) {
+        Some(e) => {
             println!("resuming dpo from checkpoint epoch {e}");
             training.checkpoint(e)
         }
+        None => training,
     };
 
     let result = training.launch(Learner::new(model, AdamConfig::new().init(), LR));

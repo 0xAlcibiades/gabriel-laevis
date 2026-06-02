@@ -2,8 +2,8 @@
 
 use clap::{Parser, Subcommand};
 use eyre::Result;
-
 use gabriel_laevis_0::train::{TrainingContext, dpo, grpo, pretrain, sft};
+use std::path::PathBuf;
 
 /// Model training.
 #[derive(Parser)]
@@ -15,6 +15,18 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Stage {
+    /// Train a byte-level BPE tokenizer on the pretraining mix.
+    Tokenizer {
+        /// Target vocabulary size.
+        #[arg(long, default_value_t = 16_384)]
+        vocab_size: usize,
+        /// Max documents sampled per domain.
+        #[arg(long, default_value_t = 50_000)]
+        docs_per_domain: usize,
+        /// Output path.
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
     /// Pretrain on with next-token cross-entropy.
     Pretrain {
         /// Corpus budget in tokens, not context length.
@@ -23,8 +35,7 @@ enum Stage {
         /// Passes over the corpus.
         #[arg(default_value_t = 10)]
         epochs: usize,
-        /// Initial weights to start from, e.g. `checkpoint/model-8`. Starts a fresh
-        /// schedule instead of auto-resuming. Default: fresh init + auto-resume.
+        /// Initial weights to start from, e.g. `checkpoint/model-n`.
         #[arg(long)]
         from: Option<String>,
     },
@@ -36,7 +47,7 @@ enum Stage {
         /// Passes over the data.
         #[arg(default_value_t = 2)]
         epochs: usize,
-        /// Base checkpoint to start from, e.g. `checkpoint/model-8`. Default: `model`.
+        /// Base checkpoint to start from, e.g. `checkpoint/model-n`.
         #[arg(long)]
         from: Option<String>,
     },
@@ -48,7 +59,7 @@ enum Stage {
         /// Passes over the data.
         #[arg(default_value_t = 1)]
         epochs: usize,
-        /// Base checkpoint to start from. Default: `model_sft`.
+        /// Base checkpoint to start from.
         #[arg(long)]
         from: Option<String>,
     },
@@ -60,12 +71,11 @@ enum Stage {
         /// Passes over the data.
         #[arg(default_value_t = 1)]
         epochs: usize,
-        /// Base checkpoint to start from. Default: `model_dpo` if present, else `model_sft`.
+        /// Base checkpoint to start from.
         #[arg(long)]
         from: Option<String>,
     },
-    /// Run all four stages in order: pretrain, sft, dpo, grpo. Each stage's size is
-    /// independently overridable; defaults match running the stages individually.
+    /// Run all stages in order.
     All {
         /// Pretrain corpus budget in tokens.
         #[arg(default_value_t = 1_000_000)]
@@ -97,9 +107,23 @@ enum Stage {
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
+    // The tokenizer stage creates the tokenizer. Thus, it must run before
+    // `TrainingContext`, which needs one.
+    if let Stage::Tokenizer {
+        vocab_size,
+        docs_per_domain,
+        out,
+    } = &cli.stage
+    {
+        return gabriel_laevis_0::train::tokenizer::run(*vocab_size, *docs_per_domain, out.clone());
+    }
+
     let ctx = TrainingContext::new()?;
 
     match cli.stage {
+        Stage::Tokenizer { .. } => {
+            unreachable!("tokenizer must exist before context creation")
+        }
         Stage::Pretrain {
             max_tokens,
             epochs,

@@ -1,5 +1,8 @@
-//! Mamba-3 (SISO) block — implemented from the paper (arXiv:2603.15569)
+//! Mamba-3 SISO
+//!
+//! Implemented from the paper at arXiv:2603.15569
 
+use crate::config::ModelConfig;
 use burn::module::Initializer;
 use burn::module::{Module, Param};
 use burn::nn::{Linear, LinearConfig, RmsNorm, RmsNormConfig};
@@ -7,10 +10,7 @@ use burn::prelude::*;
 use burn::tensor::Distribution;
 use burn::tensor::activation;
 
-use crate::config::ModelConfig;
-
-/// Minimum decay rate: A is clamped to `≤ -A_FLOOR` so the state always forgets a
-/// little (matches the reference `A_floor`).
+/// Minimum decay rate
 const A_FLOOR: f64 = 1e-4;
 /// Δ initialization range (reference `dt_min`/`dt_max`), inverse-softplus'd into
 /// `dt_bias` so the initial Δ is spread log-uniformly over this range.
@@ -101,14 +101,16 @@ impl<B: Backend> Mamba3State<B> {
     }
 }
 
+/// The Mamba-3 (SISO) mixer block.
+///
+/// All seven per-step input projections share the same input `u` and the same fan-in
+/// (d_model), so they are fused into one `d_model -> proj_out` matmul and sliced in
+/// `project` (one GEMM/launch per block instead of seven; KaimingUniform keys off
+/// fan-in, so the fused init is distributionally identical to seven separate ones).
+/// Output layout: [ xz(2·d_inner) | B(ngroups·N) | C(ngroups·N) | Δ(nheads) |
+///                  A(nheads) | λ(nheads) | θ(num_rope_angles) ].
 #[derive(Module, Debug)]
 pub struct Mamba3Block<B: Backend> {
-    // All seven per-step input projections share the same input `u` and the same fan-in
-    // (d_model), so they are fused into one `d_model -> proj_out` matmul and sliced in
-    // `project` (one GEMM/launch per block instead of seven; KaimingUniform keys off
-    // fan-in, so the fused init is distributionally identical to seven separate ones).
-    // Output layout: [ xz(2·d_inner) | B(ngroups·N) | C(ngroups·N) | Δ(nheads) |
-    //                  A(nheads) | λ(nheads) | θ(num_rope_angles) ].
     in_proj: Linear<B>,
     out_proj: Linear<B>,          // d_inner -> d_model
     bc_norm: RmsNorm<B>,          // QK-norm on B and C (over d_state)
@@ -215,8 +217,7 @@ impl<B: Backend> Mamba3Block<B> {
         let gn = self.ngroups * n;
         let na = self.num_rope_angles;
 
-        // Single fused matmul, then slice each segment (all views — grouped before the
-        // compute below). Layout: xz | B | C | Δ | A | λ | θ.
+        // Single fused matmul, then slice each segment. Layout: xz | B | C | Δ | A | λ | θ.
         let proj = self.in_proj.forward(u); // [B,T,proj_out]
         let seg = |start: usize, end: usize| proj.clone().slice([0..b, 0..t, start..end]);
         let two_di = 2 * di;
@@ -242,18 +243,17 @@ impl<B: Backend> Mamba3Block<B> {
         let delta = activation::softplus(dt_raw.add(dt_bias), 1.0); // [B,T,nh]
         let a = activation::softplus(a_raw, 1.0).neg().clamp_max(-A_FLOOR); // A ≤ -A_FLOOR [B,T,nh]
 
-        // Per-step log-decay La = Δ·A ≤ 0 (per head; the chunked segment-sum decay
-        // bounds it, so no rate clamp is needed). α = exp(La).
+        // Per-step log-decay La = Δ·A ≤ 0, α = exp(La).
         let la = delta.clone().mul(a); // [B,T,nh]
         let alpha = la.clone().exp();
 
-        // λ = σ(trap); β = (1-λ)·Δ·α; γ = λ·Δ — broadcast per head to per channel.
+        // λ = σ(trap); β = (1-λ)·Δ·α; γ = λ·Δ,  broadcast per head to per channel.
         let lambda = activation::sigmoid(trap_raw);
         let one_minus_lambda = lambda.clone().neg().add_scalar(1.0);
         let beta = self.heads_to_channels(one_minus_lambda.mul(delta.clone()).mul(alpha));
         let gamma = self.heads_to_channels(lambda.mul(delta));
 
-        // B_t, C_t = BCNorm(slice) + bias, per group [B,T,ngroups,N].
+        // B_t, C_t = BCNorm(slice) and bias, per group [B,T,ngroups,N].
         let b_t = self.norm_bc(b_raw, self.b_bias.val());
         let c_t = self.norm_bc(c_raw, self.c_bias.val());
 
@@ -269,9 +269,8 @@ impl<B: Backend> Mamba3Block<B> {
         }
     }
 
-    /// Expand per-group B/C `[B, T, ngroups, N]` to per-head `[B, nheads, T, N]`
-    /// (head `h` takes group `h / (nheads/ngroups)`) and apply the half-RoPE by the
-    /// shared cumulative phase `phi` `[B, T, na]`.
+    /// Expand per-group B/C `[B, T, ngroups, N]` to per-head `[B, nheads, T, N]` and apply the
+    /// half-RoPE by the shared cumulative phase `phi` `[B, T, na]`.
     fn rope_heads(&self, bc: Tensor<B, 4>, phi: Tensor<B, 3>) -> Tensor<B, 4> {
         let [b, t, g, n] = bc.dims();
         let nh = self.nheads;
@@ -301,11 +300,10 @@ impl<B: Backend> Mamba3Block<B> {
     }
 
     /// Parallel prefill that also returns the recurrent [`Mamba3State`] left after the
-    /// last timestep, so a prompt can be consumed in one chunked scan (instead of
-    /// `T` serial `step`s) and decoding resumes from the carried state. The `[B,T,d_model]`
-    /// output is identical to [`Mamba3Block::forward`]; the returned state is identical
-    /// (to float precision) to having called `step` `T` times — see
-    /// `forward_with_state_matches_step_carry`.
+    /// last timestep, so a prompt can be consumed in one chunked scan and decoding
+    /// resumes from the carried state. The `[B,T,d_model]` output is identical
+    /// to [`Mamba3Block::forward`]; the returned state is identical to having called
+    /// `step` `T` times.
     pub fn forward_with_state(&self, u: Tensor<B, 3>) -> (Tensor<B, 3>, Mamba3State<B>) {
         let co = self.project(u);
         let (y, h) = self.scan_chunked_carry(&co, crate::config::run().chunk);
@@ -317,7 +315,7 @@ impl<B: Backend> Mamba3Block<B> {
         // the final token, so derive them from that single column rather than over all T:
         //   phi    = Σ_t theta  (the cumulative phase at T-1; decode does phi += theta)
         //   x_prev = x[T-1]
-        //   b_prev = rope(B[T-1], phi)  (rope a single step, not the whole sequence)
+        //   b_prev = rope(B[T-1], phi)
         let [bsz, t_len, di] = co.x.dims();
         let n = self.d_state;
         let nh = self.nheads;
@@ -356,9 +354,8 @@ impl<B: Backend> Mamba3Block<B> {
     /// forms the intra-chunk output `(C·Bᵀ ∘ D)·V` for the current (`γx`,`B`) and
     /// previous (`βx_{-1}`,`B_{-1}`) trapezoidal terms, reads the carried state out
     /// decayed by `exp(La_τ)`, and carries the state to the chunk end. `c` is the chunk
-    /// length: chunk size is mathematically irrelevant (the factorization is exact), so
-    /// any drift vs `c` is pure float accumulation in the `[L,L]` score/decay matmuls —
-    /// see the `chunk_precision_sweep` test.
+    /// length: chunk size is mathematically irrelevant, so any drift vs `c` is pure
+    /// float accumulation in the `[L,L]` score/decay matmuls.
     fn scan_chunked(&self, co: &Coeffs<B>, c: usize) -> Tensor<B, 3> {
         self.scan_chunked_carry(co, c).0
     }
@@ -398,9 +395,10 @@ impl<B: Backend> Mamba3Block<B> {
         }); // β·x_{t-1}                                                    [B,T,di]
 
         // Pad the time axis up to a whole number `nc` of chunks. Padded positions carry
-        // gx=bx=la=0, so they contribute nothing to any real output or carried state — the
-        // exclusive-causal mask only reads σ ≤ τ (all real for a real τ; padding is at the
-        // tail of the last chunk), and the padded outputs are sliced off at the end.
+        // gx=bx=la=0, so they contribute nothing to any real output or carried state.
+        //
+        // The exclusive-causal mask only reads σ ≤ τ, and the padded outputs are sliced
+        // off at the end.
         let nc = t_len.div_ceil(c);
         let t2 = nc * c;
         let pad = t2 - t_len;
@@ -418,8 +416,7 @@ impl<B: Backend> Mamba3Block<B> {
             (b_rot, c_rot, b_prev, gx, bx, la_h)
         };
 
-        // Flatten (B, nh, nc) into one batch dim `g` so the per-chunk work becomes a stack
-        // of plain 3-D batched matmuls (one GEMM per op for the whole sequence, not per chunk).
+        // Flatten (B, nh, nc) into one batch dim `g`.
         let g = bsz * nh * nc;
         let crot = c_rot.reshape([g, c, n]); // [G,L,N]
         let brot = b_rot.reshape([g, c, n]);
@@ -496,7 +493,7 @@ impl<B: Backend> Mamba3Block<B> {
         let ch = crot.matmul(h_in.swap_dims(1, 2)); // [G,L,hp]
         let y_inter = acs.exp().unsqueeze_dim::<3>(2).mul(ch); // [G,L,hp]
 
-        // Recombine diagonal + off-diagonal terms, restore [B,T,d_inner], strip padding.
+        // Recombine diagonal and off-diagonal terms, restore [B,T,d_inner], strip padding.
         let y = y_intra
             .add(y_inter)
             .reshape([bsz, nh, nc, c, hp])
@@ -518,16 +515,14 @@ impl<B: Backend> Mamba3Block<B> {
     }
 
     /// One recurrent step for cached generation: `[B,1,d_model]` + state →
-    /// (`[B,1,d_model]`, next state). The same per-head recurrence as `scan`.
+    /// (`[B,1,d_model]`, next state).
     pub fn step(&self, u: Tensor<B, 3>, state: Mamba3State<B>) -> (Tensor<B, 3>, Mamba3State<B>) {
         let [b, _, _] = u.dims();
         let di = self.d_inner;
         let n = self.d_state;
         let nh = self.nheads;
         let hp = self.headdim;
-        let g = self.ngroups;
         let na = self.num_rope_angles;
-        let rd = 2 * na;
 
         let co = self.project(u);
         // Per-head, per-channel scalars (T = 1).
@@ -540,30 +535,13 @@ impl<B: Backend> Mamba3Block<B> {
         let z = co.z.reshape([b, di]);
         let theta = co.theta.reshape([b, na]);
 
-        let phi = state.phi.add(theta); // [B,na]
-        // Per-head B/C (group → head), then half-RoPE by the shared phi.
-        let to_heads = |bc: Tensor<B, 4>| {
-            bc.reshape([b, g, n])
-                .unsqueeze_dim::<4>(2)
-                .expand([b, g, nh / g, n])
-                .reshape([b, nh, n]) // [B,nh,N]
-        };
-        let rotate = |full: Tensor<B, 3>| {
-            let head = full.clone().slice([0..b, 0..nh, 0..rd]);
-            let phih = phi
-                .clone()
-                .unsqueeze_dim::<3>(1)
-                .expand([b, nh, na])
-                .reshape([b * nh, na]);
-            let rot = rotate_pairs(head.reshape([b * nh, na, 2]), phih).reshape([b, nh, rd]);
-            if rd == n {
-                rot
-            } else {
-                Tensor::cat(vec![rot, full.slice([0..b, 0..nh, rd..n])], 2)
-            }
-        };
-        let b_rot = rotate(to_heads(co.b)); // [B,nh,N]
-        let c_rot = rotate(to_heads(co.c));
+        let phi = state.phi.add(theta); // [B,na] cumulative rotation phase
+        // Per-head B/C: group → head + half-RoPE by the cumulative phase, shared with the scan
+        // path via `rope_heads`. Here T = 1, so wrap phi in a length-1 time axis and squeeze
+        // the time axis back out of the result.
+        let phi_seq = phi.clone().reshape([b, 1, na]);
+        let b_rot = self.rope_heads(co.b, phi_seq.clone()).reshape([b, nh, n]); // [B,nh,N]
+        let c_rot = self.rope_heads(co.c, phi_seq).reshape([b, nh, n]);
 
         // h = α⊙h + (γ·x)⊗B + (β·x_prev)⊗B_prev, per head [B,nh,hp,N].
         let h_prev = state.h.reshape([b, nh, hp, n]);
@@ -611,8 +589,7 @@ mod tests {
 
     type B = burn::backend::NdArray;
 
-    /// Small config so tests stay fast. headdim 32 divides d_inner = expand·d_model =
-    /// 128 → 4 heads; d_state 32 → 8 rope angles.
+    /// Small config so tests stay fast.
     fn small(vocab: usize) -> ModelConfig {
         ModelConfig::new()
             .with_vocab_size(vocab)

@@ -1,11 +1,10 @@
 //! A single residual layer using a Mamba-3 mixer and SwiGLU MLP, both pre-normed.
 
+use crate::config::ModelConfig;
+use crate::model::mamba3::{Mamba3Block, Mamba3State};
 use burn::module::Module;
 use burn::nn::{Linear, LinearConfig, RmsNorm, RmsNormConfig, SwiGlu, SwiGluConfig};
 use burn::prelude::*;
-
-use crate::config::ModelConfig;
-use crate::model::mamba3::{Mamba3Block, Mamba3State};
 
 #[derive(Module, Debug)]
 pub struct Layer<B: Backend> {
@@ -30,8 +29,7 @@ impl<B: Backend> Layer<B> {
     }
 
     pub fn forward(&self, x: Tensor<B, 3>) -> Tensor<B, 3> {
-        // Pre-norm residual around the Mamba-3 mixer. The freshly computed tensor is the
-        // LHS so Burn can reuse its buffer in-place; the residual clone is on the RHS.
+        // Pre-norm residual around the Mamba-3 mixer.
         let residual = x.clone();
         let x = self.mixer.forward(self.mixer_norm.forward(x)) + residual;
         // Pre-norm residual around the SwiGLU MLP.
@@ -51,11 +49,9 @@ impl<B: Backend> Layer<B> {
     /// instead of `T` serial steps. Output matches [`Layer::forward`]; the state matches
     /// having called [`Layer::step`] `T` times.
     pub fn forward_with_state(&self, x: Tensor<B, 3>) -> (Tensor<B, 3>, Mamba3State<B>) {
-        // Pre-norm residual around the Mamba-3 mixer (parallel prefill variant).
         let residual = x.clone();
         let (mixed, state) = self.mixer.forward_with_state(self.mixer_norm.forward(x));
         let x = mixed + residual;
-        // Pre-norm residual around the SwiGLU MLP (stateless).
         let residual = x.clone();
         let ff = self
             .ff_down

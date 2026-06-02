@@ -1,7 +1,5 @@
 //! OpenAI-compatible inference server. See `serve --help`.
 
-use std::sync::Arc;
-
 use axum::extract::State;
 use axum::response::sse::{Event, Sse};
 use axum::response::{IntoResponse, Response};
@@ -13,16 +11,15 @@ use burn::record::CompactRecorder;
 use clap::Parser;
 use eyre::{Result, WrapErr};
 use fastokens::DecodeStream;
+use gabriel_laevis_0::Compute;
+use gabriel_laevis_0::config::{ModelConfig, artifact_dir};
+use gabriel_laevis_0::model::GabrielLaevis;
+use gabriel_laevis_0::model::lm::Sampling;
+use gabriel_laevis_0::utils::load_tokenizer;
 use kanal::AsyncReceiver;
 use serde::Deserialize;
 use serde_json::json;
-
-use gabriel_laevis_0::Compute;
-use gabriel_laevis_0::config::{ModelConfig, artifact_dir};
-use gabriel_laevis_0::constants::TOKENIZER_REPO;
-use gabriel_laevis_0::data::load_tokenizer;
-use gabriel_laevis_0::model::GabrielLaevis;
-use gabriel_laevis_0::model::lm::Sampling;
+use std::sync::Arc;
 
 type Device = burn::tensor::Device<Compute>;
 
@@ -47,7 +44,6 @@ struct AppState {
     model: GabrielLaevis<Compute>,
     tokenizer: Arc<fastokens::Tokenizer>,
     device: Device,
-    /// `<|im_end|>` id, used to stop generation at the ChatML turn boundary.
     stop_token: Option<i64>,
 }
 
@@ -76,7 +72,6 @@ struct ChatRequest {
     frequency_penalty: Option<f32>,
     #[serde(default)]
     presence_penalty: Option<f32>,
-    /// Per-request sampling seed (reproducible host-side Gumbel noise).
     #[serde(default)]
     seed: Option<u64>,
     #[serde(default)]
@@ -102,7 +97,6 @@ struct CompletionRequest {
     frequency_penalty: Option<f32>,
     #[serde(default)]
     presence_penalty: Option<f32>,
-    /// Per-request sampling seed (reproducible host-side Gumbel noise).
     #[serde(default)]
     seed: Option<u64>,
     #[serde(default)]
@@ -117,8 +111,8 @@ async fn main() -> Result<()> {
 
     let artifact = artifact_dir();
 
-    let tokenizer = Arc::new(load_tokenizer(TOKENIZER_REPO).wrap_err("loading tokenizer")?);
-    let stop_token = gabriel_laevis_0::chat::im_end_id(tokenizer.as_ref());
+    let tokenizer = Arc::new(load_tokenizer().wrap_err("loading tokenizer")?);
+    let stop_token = Some(gabriel_laevis_0::chat::TURN_END_ID);
 
     let cfg = ModelConfig::load(artifact.join("config.json")).wrap_err("loading config")?;
     cfg.validate()?;
@@ -153,9 +147,7 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// Spawn blocking generation, streaming token ids over a kanal channel — sync
-/// sender on the blocking thread, async receiver for the handler. Concurrent
-/// requests run concurrently (no lock; see `AppState`).
+/// Spawn blocking generation, streaming token ids over a kanal channel
 fn token_channel(
     state: Arc<AppState>,
     prompt_ids: Vec<i64>,

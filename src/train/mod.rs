@@ -1,25 +1,23 @@
-//! Training stages and shared context. The `train` binary dispatches into these.
+//! Training stages and shared context.
 
 pub mod context;
 pub mod dpo;
 pub mod grpo;
 pub mod pretrain;
 pub mod sft;
-
+pub mod tokenizer;
 pub use context::TrainingContext;
 
-/// Every stage checkpoints (and resumes) on this fixed step interval, so a crash at
-/// hour N of an overnight run loses at most this many steps, not the whole run.
+/// Every stage checkpoints and resumes on this fixed step interval.
 pub const STEPS_PER_CHECKPOINT: usize = 1000;
 
-/// How a run is sliced for checkpointing. Burn checkpoints once per epoch over
-/// fixed-size epochs, so we run whole `STEPS_PER_CHECKPOINT`-step "checkpoint epochs".
+/// How a run is sliced for checkpointing.
 pub struct Schedule {
-    /// Number of checkpoint-epochs (i.e. number of saves).
+    /// Number of checkpoint-epochs.
     pub ckpt_epochs: usize,
-    /// Samples drawn per checkpoint-epoch (with replacement via `SamplerDataset`).
+    /// Samples drawn per checkpoint-epoch.
     pub epoch_samples: usize,
-    /// Total optimizer steps across the whole run (for LR schedules).
+    /// Total optimizer steps across the whole run.
     pub total_steps: usize,
 }
 

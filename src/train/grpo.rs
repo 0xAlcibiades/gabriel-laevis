@@ -1,15 +1,23 @@
 //! GRPO (Group Relative Policy Optimization) stage.
 //!
 //! For each prompt we sample a group of `G` completions with the current
-//! policy, score them with a **verifiable** reward (does the completion end in
-//! the correct integer?), normalize rewards within the group to advantages, and
-//! take a policy-gradient step with a KL penalty toward the frozen SFT
-//! reference:
+//! policy, score them with a verifiable reward, normalize rewards within
+//! the group to advantages, and take a policy-gradient step with a KL
+//! penalty toward the frozen SFT reference:
 //!
 //!    loss = -mean(A · logπ) + β · KL_k3(π ‖ π_ref)
 
 use std::sync::Arc;
 
+use crate::config::ModelConfig;
+use crate::constants::{
+    GRPO_COMPLETION_LEN, GRPO_GROUP_SIZE, GRPO_KL_BETA, GRPO_PROMPT_LEN, GSM8K_FILE, GSM8K_REPO,
+    NUM_WORKERS, SHUFFLE_SEED,
+};
+use crate::data::{GrpoBatch, GrpoBatcher, GrpoDataset, GrpoExample, load_gsm8k, split_valid};
+use crate::model::GabrielLaevis;
+use crate::model::lm::{Sampling, sequence_logprob};
+use crate::train::TrainingContext;
 use burn::config::Config;
 use burn::data::dataloader::DataLoaderBuilder;
 use burn::data::dataset::transform::SamplerDataset;
@@ -28,26 +36,13 @@ use burn::train::{
 };
 use eyre::{Result, WrapErr};
 
-use crate::config::ModelConfig;
-use crate::constants::{
-    GRPO_COMPLETION_LEN, GRPO_GROUP_SIZE, GRPO_KL_BETA, GRPO_PROMPT_LEN, GSM8K_FILE, GSM8K_REPO,
-    NUM_WORKERS, SHUFFLE_SEED, TOKENIZER_REPO,
-};
-use crate::data::{
-    GrpoBatch, GrpoBatcher, GrpoDataset, GrpoExample, load_gsm8k, load_tokenizer, split_valid,
-};
-use crate::model::GabrielLaevis;
-use crate::model::lm::{Sampling, sequence_logprob};
-use crate::train::TrainingContext;
-
 const BATCH_SIZE: usize = 4; // prompts per step
 const VALID_PROMPTS: usize = 32;
 const LR: f64 = 1.0e-6;
 const TEMPERATURE: f64 = 1.0; // exploration during rollouts
 const ADV_EPS: f32 = 1e-4;
 
-/// Last signed integer appearing in `s`, or `None` if it has no digits. The verifiable
-/// signal for GSM8K (answers are integers) and the GRPO reward.
+/// Last signed integer appearing in `s`, or `None` if it has no digits.
 fn extract_last_int(s: &str) -> Option<String> {
     let mut last = None;
     let mut cur = String::new();
@@ -83,9 +78,7 @@ fn reward(completion: &str, answer: &str) -> f32 {
     }
 }
 
-/// Sample `G` completions per prompt with `gen` and score them. Generic over the
-/// generator backend so the train path can pass `policy.valid()` (inner) and the
-/// valid path can pass the (already-inner) policy.
+/// Sample `G` completions per prompt with `gen` and score them.
 fn sample_all<G: Backend>(
     sampler: &GabrielLaevis<G>,
     batch: &GrpoBatch,
@@ -93,7 +86,7 @@ fn sample_all<G: Backend>(
 ) -> (Vec<Vec<Vec<i64>>>, Vec<Vec<f32>>) {
     let sampling = Sampling {
         temperature: TEMPERATURE,
-        stop_token: crate::chat::im_end_id(&batch.tokenizer),
+        stop_token: Some(crate::chat::TURN_END_ID),
         ..Default::default()
     };
 
@@ -101,10 +94,10 @@ fn sample_all<G: Backend>(
     let mut rewards = Vec::with_capacity(batch.prompts.len());
 
     for (prompt, answer) in batch.prompts.iter().zip(&batch.answers) {
-        // One batched pass produces the whole group of GRPO_GROUP_SIZE completions
-        // (prompt primed once, rollouts stepped in parallel). Prompts are non-empty by
-        // construction; on the off chance generation errors, score the group as empty
-        // (zero-reward) completions rather than panic.
+        // One batched pass produces the whole group of GRPO_GROUP_SIZE completions.
+        // Prompts are non-empty by construction; on the off chance generation
+        // errors, score the group as empty (zero-reward) completions rather
+        // than panic.
         let group = sampler
             .generate_group(
                 prompt,
@@ -140,9 +133,7 @@ pub struct GrpoModel<B: Backend> {
 }
 
 impl<B: AutodiffBackend> GrpoModel<B> {
-    /// Score sampled groups: build PG + KL loss and the reward-accuracy output. Only
-    /// called from the train step (autodiff backend), so the frozen reference runs on
-    /// the inner backend — no autograd graph, no per-step leak.
+    /// Score sampled groups.
     fn score(
         &self,
         prompts: &[Vec<i64>],
@@ -151,7 +142,7 @@ impl<B: AutodiffBackend> GrpoModel<B> {
         device: &B::Device,
     ) -> ClassificationOutput<B> {
         let ignore = crate::chat::IGNORE_ID as i64;
-        let reference = self.reference.valid(); // inner-backend module, graph-free
+        let reference = self.reference.valid();
         let mut group_losses: Vec<Tensor<B, 1>> = Vec::new();
         let mut corrects: Vec<Tensor<B, 1>> = Vec::new();
 
@@ -159,9 +150,9 @@ impl<B: AutodiffBackend> GrpoModel<B> {
             let g = group.len();
             let p = prompt.len();
             // Completions are ragged: EOS can end one early, and a failed/immediate-EOS
-            // rollout can be empty. Pad the group to its longest sequence; padding (and
-            // the prompt prefix) is IGNORE_ID in both input and target, so it's masked
-            // out of sequence_logprob and adds no signal — only trailing compute.
+            // rollout can be empty. Pad the group to its longest sequence; padding and
+            // the prompt prefix is IGNORE_ID in both input and target, so it's masked
+            // out of sequence_logprob and adds no signal.
             let max_c = group.iter().map(|c| c.len()).max().unwrap_or(0);
 
             if max_c == 0 {
@@ -170,9 +161,7 @@ impl<B: AutodiffBackend> GrpoModel<B> {
 
             let l = p + max_c - 1; // next-token shifted length of the longest sequence
 
-            // Fill flat [G, l] buffers pre-initialised to IGNORE_ID, writing each row with
-            // copy_from_slice instead of per-token push/branch. Token ids are CPU-born (from
-            // the tokenizer), so this stays host-side.
+            // Fill flat [G, l] buffers pre-initialised to IGNORE_ID.
             let mut in_flat = vec![ignore; g * l];
             let mut tg_flat = vec![ignore; g * l];
 
@@ -188,7 +177,7 @@ impl<B: AutodiffBackend> GrpoModel<B> {
                     continue;
                 }
 
-                // Inputs: prompt + comp without its final token (the shifted-input frame).
+                // Inputs: prompt and comp without its final token (the shifted-input frame).
                 let in_row = &mut in_flat[row_start..row_start + p + c - 1];
                 in_row[..p].copy_from_slice(prompt);
                 in_row[p..].copy_from_slice(&comp[..c - 1]);
@@ -204,17 +193,12 @@ impl<B: AutodiffBackend> GrpoModel<B> {
 
             let logp = sequence_logprob(self.policy.forward(inputs.clone()), targets.clone()); // [G] grad
 
-            // Reference on the inner backend: building its graph on the autodiff backend
-            // and `.detach()`-ing only the output still retains every activation across
-            // steps (backward consumes only the policy graph) — an unbounded leak. The
-            // inner forward holds no graph; `from_inner` lifts the result back to B.
             let logp_ref = Tensor::from_inner(sequence_logprob(
                 reference.forward(inputs.inner()),
                 targets.inner(),
             )); // [G]
 
-            // Rewards are host-born (string-parsed from completions); upload once, then
-            // normalize to group advantages on-device.
+            // Rewards are host-born; upload once, then normalize to group advantages on-device.
             let r = Tensor::<B, 1>::from_data(TensorData::new(group_r.clone(), [g]), device);
             let mean = r.clone().mean();
 
@@ -233,9 +217,8 @@ impl<B: AutodiffBackend> GrpoModel<B> {
             corrects.push(r.greater_equal_elem(1.0).float()); // [G], 1 where reward == 1
         }
 
-        // Every group was empty (all rollouts immediately hit EOS / failed): no usable
-        // signal this step. Return a detached zero loss so the step is a no-op instead
-        // of panicking in Tensor::cat on an empty vec.
+        // Every group was empty, no usable signal this step. Return a detached zero loss
+        // so the step is a no-op.
         if group_losses.is_empty() {
             let loss = Tensor::<B, 1>::zeros([1], device).mean();
             let logits = Tensor::<B, 2>::zeros([1, 2], device);
@@ -261,11 +244,9 @@ impl<B: AutodiffBackend> TrainStep for GrpoModel<B> {
     type Output = ClassificationOutput<B>;
 
     fn step(&self, batch: GrpoBatch) -> TrainOutput<ClassificationOutput<B>> {
-        // Sample on the inner backend.
         let sampler = self.policy.valid();
         let idev = sampler.device();
         let (comps, rewards) = sample_all(&sampler, &batch, &idev);
-
         let device = self.policy.device();
         let item = self.score(&batch.prompts, &comps, &rewards, &device);
         TrainOutput::new(self, item.loss.backward(), item)
@@ -276,14 +257,14 @@ impl<B: Backend> InferenceStep for GrpoModel<B> {
     type Input = GrpoBatch;
     type Output = SolveCounts;
 
-    /// Validation = the held-out solve rate (plotted live in the TUI). pass@k reuses
-    /// the rollout group (any of `GRPO_GROUP_SIZE` correct); pass@1 adds one greedy
-    /// sample. The pass@1↓-while-pass@k-holds gap is the GRPO collapse signal.
+    /// Validate with the held-out solve rate. pass@k reuses the rollout group;
+    /// pass@1 adds one greedy sample. The pass@1↓-while-pass@k-holds gap is
+    /// the GRPO collapse signal.
     fn step(&self, batch: GrpoBatch) -> SolveCounts {
         let device = self.policy.device();
         let (_comps, rewards) = sample_all(&self.policy, &batch, &device);
         let greedy = Sampling {
-            stop_token: crate::chat::im_end_id(&batch.tokenizer),
+            stop_token: Some(crate::chat::TURN_END_ID),
             ..Sampling::greedy()
         };
         let (mut pass1, mut pass_k) = (0usize, 0usize);
@@ -322,8 +303,7 @@ pub fn run(
     epochs: usize,
     from: Option<&str>,
 ) -> Result<()> {
-    let cfg = ModelConfig::load(ctx.checkpoint_path("config.json"))
-        .wrap_err("loading config (run `train sft` first)")?;
+    let cfg = ModelConfig::load(ctx.checkpoint_path("config.json")).wrap_err("loading config")?;
     cfg.validate()?;
 
     // `--from` wins; otherwise chain off the freshest upstream checkpoint: DPO's output
@@ -341,7 +321,7 @@ pub fn run(
                 &CompactRecorder::new(),
                 &ctx.device,
             )
-            .wrap_err_with(|| format!("loading {base} as {what} (run `train sft`/`dpo` first)"))
+            .wrap_err_with(|| format!("loading {base} as {what}"))
     };
 
     let model = GrpoModel {
@@ -349,41 +329,34 @@ pub fn run(
         reference: load("reference")?,
     };
 
-    println!("loading {GSM8K_REPO} (up to {max_examples} prompts)...");
+    println!("loading {GSM8K_REPO} with up to {max_examples} prompts...");
     let pairs = load_gsm8k(GSM8K_REPO, GSM8K_FILE, max_examples).wrap_err("loading gsm8k")?;
 
-    // Skip prompts with bytes the frozen-vocab tokenizer can't encode (rare in GSM8K,
-    // but cheap to be safe) instead of aborting the stage.
-    let total = pairs.len();
     let examples: Vec<GrpoExample> = pairs
         .into_iter()
-        .filter_map(|(q, answer)| {
+        .map(|(q, answer)| {
             let prompt: Vec<i64> = ctx
                 .tokenizer
                 .encode(&crate::chat::render_prompt(&q))
-                .ok()?
+                .wrap_err("encoding gsm8k prompt")?
                 .into_iter()
                 .take(GRPO_PROMPT_LEN) // truncate to the prompt budget as we collect
                 .map(|x| x as i64)
                 .collect();
-            Some(GrpoExample { prompt, answer })
+            Ok(GrpoExample { prompt, answer })
         })
-        .collect();
-
-    if examples.len() < total {
-        println!("skipped {} unencodable prompts", total - examples.len());
-    }
+        .collect::<Result<_>>()?;
 
     let (examples, valid_examples) = split_valid(examples, VALID_PROMPTS);
 
     // Owned tokenizer for the batcher (re-loaded from cache; avoids needing Clone).
-    let tokenizer = std::sync::Arc::new(load_tokenizer(TOKENIZER_REPO).wrap_err("load tokenizer")?);
+    let tokenizer = std::sync::Arc::new(crate::utils::load_tokenizer().wrap_err("load tokenizer")?);
     let batcher = GrpoBatcher { tokenizer };
 
     // Slice into shared 1000-step checkpoint-epochs with auto-resume (see dpo/pretrain).
     let sched = crate::train::schedule(examples.len(), BATCH_SIZE, epochs);
     println!(
-        "training {} steps (~{epochs} passes over {} prompts) as {} x {}-step checkpoints",
+        "training {} steps in ~{epochs} passes over {} prompts as {} x {}-step checkpoints",
         sched.total_steps,
         examples.len(),
         sched.ckpt_epochs,
@@ -415,14 +388,13 @@ pub fn run(
         .num_epochs(sched.ckpt_epochs)
         .summary();
 
-    // Auto-resume from the latest checkpoint in the stage dir unless `--from` was given
-    // (which starts fresh from the named weights). Mirrors pretrain.
-    let training = match (from, ctx.latest_checkpoint_epoch(&grpo_dir)) {
-        (Some(_), _) | (None, None) => training,
-        (None, Some(e)) => {
+    // Auto-resume from the latest checkpoint in the stage dir unless `--from` was given.
+    let training = match ctx.resume_epoch(from, &grpo_dir) {
+        Some(e) => {
             println!("resuming grpo from checkpoint epoch {e}");
             training.checkpoint(e)
         }
+        None => training,
     };
 
     let result = training.launch(Learner::new(model, AdamConfig::new().init(), LR));
@@ -449,8 +421,7 @@ pub fn run(
 // coverage narrows.
 
 /// Per-validation-batch solve counts: the `InferenceStep` returns this so the held-out
-/// pass@1 / pass@k render live as numeric metrics. Carries no tensors, so [`ItemLazy`]
-/// is a no-op — the work (generation) already happened in the step.
+/// pass@1 / pass@k render live as numeric metrics.
 #[derive(Debug, Clone, Copy)]
 pub struct SolveCounts {
     /// Prompts solved by the single greedy sample.
@@ -468,8 +439,8 @@ impl ItemLazy for SolveCounts {
     }
 }
 
-/// [`SolveRateMetric`] input — full per-batch counts; the metric picks pass@1 vs
-/// pass@k by its [`SolveKind`], so both metrics share one [`Adaptor`] impl.
+/// [`SolveRateMetric`] input; the metric picks pass@1 vs pass@k
+/// by its [`SolveKind`], so both metrics share one [`Adaptor`] impl.
 pub struct SolveRateInput {
     pass1: usize,
     pass_k: usize,
@@ -492,8 +463,7 @@ enum SolveKind {
     PassK,
 }
 
-/// A held-out solve-rate metric (a percentage, higher is better), plottable in the
-/// TUI. One instance tracks one rate — pass@1 or pass@k — selected at construction.
+/// A held-out solve-rate metric.
 #[derive(Clone)]
 pub struct SolveRateMetric {
     name: MetricName,

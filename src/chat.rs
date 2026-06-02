@@ -1,27 +1,95 @@
-//! ChatML conversation template — roles, messages, and rendering.
+//! Conversation template
+//!
+//! Leverages Gemma-4-style control tokens: turns, roles, rendering.
+//!
+//! - A turn is `<|turn>{role}\n…<turn|>`.
+//! - Roles render as plain words.
+//! - Optional reasoning renders in a thought channel (`<|channel>thought\n…\n<channel|>`)
+//!   before the content.
+//!
+//! TODO:
+//! Only the text + thinking path is rendered today. The other reserved control tokens
+//! (tool-calling, image/audio/video — see [`SpecialToken`]) are kept in the vocab on purpose
+//! so adding those capabilities later needs no from-scratch re-pretrain; their rendering
+//! lands with the tool-use loop / multimodal work.
 
-/// Loss-ignore target id (SmolLM2 `<|endoftext|>` = 0). Targets set to this are
-/// dropped by the cross-entropy loss (`with_pad_tokens`), so SFT trains only on
-/// the assistant response. It never appears as a target in normal text, so it's
-/// a no-op for pretraining.
-pub const IGNORE_ID: usize = 0;
-
-/// Token id of the ChatML turn terminator `<|im_end|>`, used as the generation stop
-/// token (so completions end at the turn boundary instead of running to the length
-/// cap). Returns `None` if the tokenizer doesn't map it to a single id.
-pub fn im_end_id(tok: &fastokens::Tokenizer) -> Option<i64> {
-    let ids = tok.encode("<|im_end|>").ok()?;
-    (ids.len() == 1).then(|| ids[0] as i64)
+/// The reserved special-token vocabulary, in id order. `train::tokenizer` reserves these in
+/// exactly this declaration order, so each variant's discriminant is its vocab id.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, strum::EnumIter)]
+pub enum SpecialToken {
+    Pad,
+    Bos,
+    Eos,
+    TurnOpen,
+    TurnClose,
+    Think,
+    ChannelOpen,
+    ChannelClose,
+    ToolOpen,
+    ToolClose,
+    ToolCallOpen,
+    ToolCallClose,
+    ToolResponseOpen,
+    ToolResponseClose,
+    StringDelim,
+    ImageOpen,
+    ImageClose,
+    AudioOpen,
+    AudioClose,
+    VideoOpen,
+    VideoClose,
+    Image,
+    Audio,
+    Video,
 }
 
-/// Conversation role. `Developer` and `Tool` cover the instruction-hierarchy and
-/// tool-calling conventions; they render as plain ChatML role tags.
+impl SpecialToken {
+    /// The literal token string the tokenizer reserves and `render` emits.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Pad => "<pad>",
+            Self::Bos => "<bos>",
+            Self::Eos => "<eos>",
+            Self::TurnOpen => "<|turn>",
+            Self::TurnClose => "<turn|>",
+            Self::Think => "<|think|>",
+            Self::ChannelOpen => "<|channel>",
+            Self::ChannelClose => "<channel|>",
+            Self::ToolOpen => "<|tool>",
+            Self::ToolClose => "<tool|>",
+            Self::ToolCallOpen => "<|tool_call>",
+            Self::ToolCallClose => "<tool_call|>",
+            Self::ToolResponseOpen => "<|tool_response>",
+            Self::ToolResponseClose => "<tool_response|>",
+            Self::StringDelim => "<|\"|>",
+            Self::ImageOpen => "<|image>",
+            Self::ImageClose => "<image|>",
+            Self::AudioOpen => "<|audio>",
+            Self::AudioClose => "<audio|>",
+            Self::VideoOpen => "<|video>",
+            Self::VideoClose => "<video|>",
+            Self::Image => "<|image|>",
+            Self::Audio => "<|audio|>",
+            Self::Video => "<|video|>",
+        }
+    }
+}
+
+/// Loss-ignore / pad target id. `<pad>` is id 0, so it never appears as a real target: the
+/// cross-entropy loss drops it (`with_pad_tokens`), masking prompt and padding.
+pub const IGNORE_ID: usize = SpecialToken::Pad as usize;
+
+/// Turn terminator `<turn|>`, used as the generation stop token (completions end at the turn
+/// boundary, not the length cap). Known by construction from [`SpecialToken`].
+pub const TURN_END_ID: i64 = SpecialToken::TurnClose as i64;
+
+/// Conversation role.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Role {
     System,
     Developer,
     User,
-    Assistant,
+    Model,
     Tool,
 }
 
@@ -32,7 +100,7 @@ impl Role {
             Role::System => "system",
             Role::Developer => "developer",
             Role::User => "user",
-            Role::Assistant => "assistant",
+            Role::Model => "model",
             Role::Tool => "tool",
         }
     }
@@ -43,7 +111,6 @@ impl Role {
 pub struct Message {
     pub role: Role,
     pub content: String,
-    /// Optional reasoning trace, rendered as `<think>…</think>` before content.
     pub thinking: Option<String>,
 }
 
@@ -68,7 +135,7 @@ impl Message {
         Self::new(Role::User, c)
     }
     pub fn assistant(c: impl Into<String>) -> Self {
-        Self::new(Role::Assistant, c)
+        Self::new(Role::Model, c)
     }
     pub fn tool(c: impl Into<String>) -> Self {
         Self::new(Role::Tool, c)
@@ -80,42 +147,48 @@ impl Message {
     }
 }
 
-/// Render a conversation to ChatML. With `add_generation_prompt`, append an open
-/// assistant turn for the model to continue. Sized up front into a single buffer.
+/// Render a conversation to the turn format.
 pub fn render(messages: &[Message], add_generation_prompt: bool) -> String {
-    // Estimate the buffer size to avoid reallocations (tags + content per turn).
+    // Estimate the buffer size to avoid spurious reallocations.
     let est_len: usize = messages.iter().map(|m| m.content.len() + 64).sum::<usize>()
-        + if add_generation_prompt { 32 } else { 0 };
+        + if add_generation_prompt { 16 } else { 0 };
 
     let mut out = String::with_capacity(est_len);
 
     for m in messages {
-        out.push_str("<|im_start|>");
+        out.push_str(SpecialToken::TurnOpen.as_str());
         out.push_str(m.role.tag());
         out.push('\n');
 
         if let Some(ref t) = m.thinking {
-            out.push_str("<think>");
+            out.push_str(SpecialToken::ChannelOpen.as_str());
+            out.push_str("thought\n");
             out.push_str(t);
-            out.push_str("</think>");
+            out.push('\n');
+            out.push_str(SpecialToken::ChannelClose.as_str());
         }
 
         out.push_str(&m.content);
-        out.push_str("<|im_end|>\n");
+        out.push_str(SpecialToken::TurnClose.as_str());
+        out.push('\n');
     }
 
     if add_generation_prompt {
-        out.push_str("<|im_start|>assistant\n");
+        out.push_str(SpecialToken::TurnOpen.as_str());
+        out.push_str(Role::Model.tag());
+        out.push('\n');
     }
     out
 }
 
-/// The prompt (user turn + open assistant turn) the model must continue.
+/// The prompt which the model must continue.
 pub fn render_prompt(user: &str) -> String {
     render(&[Message::user(user)], true)
 }
 
-/// The full templated SFT example: user turn + assistant response, closed. Note
+/// The full templated example for SFT: user turn + model response, closed.
+///
+/// NOTE:
 /// `render_prompt(user)` is a prefix of this, which the response-loss masking in
 /// `build_sft_row` relies on.
 pub fn render_full(user: &str, assistant: &str) -> String {
@@ -143,8 +216,8 @@ mod tests {
             ],
             true,
         );
-        assert!(s.contains("<|im_start|>system\nbe nice<|im_end|>"));
-        assert!(s.contains("<|im_start|>assistant\n<think>add them</think>4<|im_end|>"));
-        assert!(s.ends_with("<|im_start|>assistant\n"));
+        assert!(s.contains("<|turn>system\nbe nice<turn|>"));
+        assert!(s.contains("<|turn>model\n<|channel>thought\nadd them\n<channel|>4<turn|>"));
+        assert!(s.ends_with("<|turn>model\n"));
     }
 }

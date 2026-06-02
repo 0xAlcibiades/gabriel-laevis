@@ -1,13 +1,4 @@
-//! Data layer: tokenizer, parquet ingestion, and the per-stage datasets/batchers.
-//!
-//! Layout, top to bottom: tokenizer loading → shared parquet helpers → generic
-//! batch/split helpers → pretraining (streaming corpus) → SFT → DPO → GRPO. Each
-//! training stage owns one section: its loader, example, `Dataset`, batch, and
-//! `Batcher` live together.
-
-use std::fs::File;
-use std::path::PathBuf;
-use std::sync::Arc;
+//! Data layer
 
 use burn::data::dataloader::batcher::Batcher;
 use burn::data::dataset::Dataset;
@@ -15,81 +6,17 @@ use burn::prelude::*;
 use eyre::{Result, WrapErr};
 use parquet::file::reader::{FileReader, SerializedFileReader};
 use parquet::record::{Row, RowAccessor};
-
-use crate::config::artifact_dir;
-
-// ===========================================================================
-// Tokenizer
-// ===========================================================================
-
-/// Load the byte-level BPE tokenizer, preferring the copy packaged beside the model
-/// in the artifact dir and falling back to fetching `repo` from HF. fastokens 0.2 can
-/// deserialize but not *run* the `Digits` pre-tokenizer, so it is rewritten in memory
-/// to the equivalent `Split` regex, preserving SmolLM2's digit splitting. The
-/// rewritten tokenizer is then written into the artifact dir, so a trained model is
-/// self-contained and later loads work offline.
-pub fn load_tokenizer(repo: &str) -> Result<fastokens::Tokenizer> {
-    use hf_hub::api::sync::Api;
-
-    let packaged = artifact_dir().join("tokenizer.json");
-    let (raw, fetched) = match std::fs::read_to_string(&packaged) {
-        Ok(s) => (s, false),
-        Err(_) => {
-            let path = Api::new()?.model(repo.to_string()).get("tokenizer.json")?;
-            (std::fs::read_to_string(path)?, true)
-        }
-    };
-
-    let mut json: serde_json::Value = serde_json::from_str(&raw)?;
-    rewrite_digits_pretokenizer(&mut json);
-
-    // First fetch: package the rewritten tokenizer beside the model so later loads —
-    // including `serve` — read it locally without hitting HF. Best-effort: a write
-    // failure just means the next load refetches.
-    if fetched && let Ok(s) = serde_json::to_string(&json) {
-        let _ = std::fs::write(&packaged, s);
-    }
-    Ok(fastokens::Tokenizer::from_json(json)?)
-}
-
-/// Rewrite every `Digits` pre-tokenizer to the equivalent `Split` regex, in place.
-/// Idempotent: a packaged copy is already rewritten, so re-running is a no-op.
-fn rewrite_digits_pretokenizer(json: &mut serde_json::Value) {
-    let Some(pretoks) = json
-        .pointer_mut("/pre_tokenizer/pretokenizers")
-        .and_then(|v| v.as_array_mut())
-    else {
-        return;
-    };
-    for p in pretoks.iter_mut() {
-        if p.get("type").and_then(|t| t.as_str()) != Some("Digits") {
-            continue;
-        }
-        // individual_digits → each digit its own pre-token `\d`, else split runs of
-        // digits `\d+`; behavior Isolated keeps them as tokens.
-        let individual = p
-            .get("individual_digits")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(true);
-        *p = serde_json::json!({
-            "type": "Split",
-            "pattern": { "Regex": if individual { r"\d" } else { r"\d+" } },
-            "behavior": "Isolated",
-            "invert": false,
-        });
-    }
-}
+use std::fs::File;
+use std::io::Read;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 // ===========================================================================
-// Shared parquet ingestion
+// Dataset ingestion
 // ===========================================================================
-//
-// The SFT/DPO/GRPO loaders all read a HF-hosted dataset parquet (the auto-converted
-// `refs/convert/parquet` revision), resolve a few columns by name, and iterate rows
-// until a cap. These three helpers factor out that shape so each loader is just its
-// column names plus a per-row extractor.
 
-/// Fetch + open a Hub dataset parquet file from the auto-converted parquet revision.
+/// Fetch and open a Hub dataset parquet file from the auto-converted parquet revision.
 fn open_hub_dataset_parquet(repo: &str, file: &str) -> Result<SerializedFileReader<File>> {
     use hf_hub::api::sync::Api;
     use hf_hub::{Repo, RepoType};
@@ -145,7 +72,7 @@ fn read_rows<T>(
 // Generic helpers shared across stages
 // ===========================================================================
 
-/// Split `rows` into `(train, valid)` with a **disjoint** held-out tail of up to
+/// Split `rows` into `(train, valid)` with a disjoint held-out tail of up to
 /// `max_valid` rows, capped at a fifth so a tiny run keeps a trainable majority.
 pub fn split_valid<T>(mut rows: Vec<T>, max_valid: usize) -> (Vec<T>, Vec<T>) {
     let n_valid = max_valid.min(rows.len() / 5);
@@ -154,7 +81,6 @@ pub fn split_valid<T>(mut rows: Vec<T>, max_valid: usize) -> (Vec<T>, Vec<T>) {
 }
 
 /// A training batch: `inputs` and next-token `targets`, both `[batch, seq_len]`.
-/// Shared by the pretraining and SFT batchers.
 #[derive(Clone, Debug)]
 pub struct Batch<B: Backend> {
     pub inputs: Tensor<B, 2, Int>,
@@ -162,7 +88,7 @@ pub struct Batch<B: Backend> {
 }
 
 // ===========================================================================
-// Pretraining: streaming, seekable corpus
+// Pretraining using a streaming, seekable corpus
 // ===========================================================================
 
 /// One row group's contiguous block of dense windows in the flattened global window
@@ -176,7 +102,7 @@ struct GroupWindows {
 }
 
 /// Dense windows a group yields from `n_tokens`: `floor(n_tokens / (seq_len+1))`. The
-/// remainder (< seq_len+1 tokens) is dropped. Pure/testable.
+/// remainder (< seq_len+1 tokens) is dropped.
 fn group_window_count(n_tokens: usize, seq_len: usize) -> usize {
     n_tokens / (seq_len + 1)
 }
@@ -207,7 +133,7 @@ fn build_window_index(
 
 /// Resolve a global window index to `(group-descriptor index, local window in group)`,
 /// or `None` if out of range. Binary search over the contiguous window blocks;
-/// zero-window groups are empty ranges and are correctly skipped. Pure/testable.
+/// zero-window groups are empty ranges and are correctly skipped.
 fn resolve_window(index: &[GroupWindows], gw: usize) -> Option<(usize, usize)> {
     let i = index
         .binary_search_by(|g| {
@@ -223,20 +149,18 @@ fn resolve_window(index: &[GroupWindows], gw: usize) -> Option<(usize, usize)> {
     Some((i, gw - index[i].win_start))
 }
 
-/// A source of documents addressable by row group — the parquet reader implements it;
-/// tests use an in-memory fake. `Send + Sync` so the dataset works under multi-worker
-/// dataloaders.
+/// A source of documents addressable by row group.
 pub trait RowGroupSource: Send + Sync {
-    /// Number of row groups (defines the index; read from metadata only).
+    /// Number of row groups.
     fn num_groups(&self) -> usize;
-    /// The `text` of every document in row group `g` (the only point that reads data).
+    /// The `text` of every document in row group `g`.
     fn group_texts(&self, g: usize) -> Result<Vec<String>>;
 }
 
 /// A FineWeb-style parquet shard. Construction reads only the footer (column index +
 /// row-group count); `group_texts` reopens the file to read a single row group, so the
 /// struct stays `Send + Sync` and holds no live reader. Misses pay one footer read plus
-/// the (cheap) tokenize — never the whole shard in RAM.
+/// the tokenize.
 pub struct ParquetShard {
     path: PathBuf,
     text_idx: usize,
@@ -244,11 +168,11 @@ pub struct ParquetShard {
 }
 
 impl ParquetShard {
-    /// Open a local parquet file and read its metadata.
-    pub fn open(path: PathBuf) -> Result<Self> {
+    /// Open a local parquet file and read its metadata, reading documents from the column.
+    pub fn open(path: PathBuf, text_column: &str) -> Result<Self> {
         let file = File::open(&path).wrap_err("opening parquet shard")?;
         let reader = SerializedFileReader::new(file).wrap_err("opening parquet reader")?;
-        let text_idx = column_index(&reader, "text")?;
+        let text_idx = column_index(&reader, text_column)?;
         let num_groups = reader.metadata().num_row_groups();
         Ok(Self {
             path,
@@ -257,11 +181,21 @@ impl ParquetShard {
         })
     }
 
-    /// Fetch shard `file` from `repo` via the HF cache, then open it.
-    pub fn from_hub(repo: &str, file: &str) -> Result<Self> {
+    /// Fetch shard `file` from `repo` at git `revision` via the HF cache, then open it on
+    /// `text_column`. `revision` selects the branch/ref the shard lives on — `"main"` for
+    /// natively-laid-out repos (FineWeb), `"refs/convert/parquet"` for the auto-converted
+    /// parquet shards (FineMath).
+    pub fn from_hub(repo: &str, file: &str, text_column: &str, revision: &str) -> Result<Self> {
         use hf_hub::api::sync::Api;
-        let path = Api::new()?.dataset(repo.to_string()).get(file)?;
-        Self::open(path)
+        use hf_hub::{Repo, RepoType};
+        let path = Api::new()?
+            .repo(Repo::with_revision(
+                repo.to_string(),
+                RepoType::Dataset,
+                revision.to_string(),
+            ))
+            .get(file)?;
+        Self::open(path, text_column)
     }
 }
 
@@ -288,6 +222,160 @@ impl RowGroupSource for ParquetShard {
     }
 }
 
+/// Blobs fetched per `group_texts` call. Also the granularity of the row-group cache,
+/// so a miss re-fetches at most this many files.
+const SWH_GROUP_SIZE: usize = 256;
+
+/// A code corpus whose parquet ships **Software-Heritage IDs**, not text (e.g. Stack-Edu):
+/// each row is a `blob_id` whose content lives at `content/{blob_id}` (gzipped) in
+/// Software Heritage's public S3 bucket. Construction reads up to `max_files` blob ids
+/// from the shard (cheap, local); `group_texts` fetches a batch of them over HTTPS and
+/// gunzips. A per-blob fetch failure drops that file (empty string) rather than aborting.
+pub struct SoftwareHeritageSource {
+    blob_ids: Vec<String>,
+}
+
+impl SoftwareHeritageSource {
+    /// Fetch the Stack-Edu-style shard `file` from `repo`@`revision`, then read up to
+    /// `max_files` ids from its `blob_column`.
+    pub fn from_hub(
+        repo: &str,
+        revision: &str,
+        file: &str,
+        blob_column: &str,
+        max_files: usize,
+    ) -> Result<Self> {
+        use hf_hub::api::sync::Api;
+        use hf_hub::{Repo, RepoType};
+        let path = Api::new()?
+            .repo(Repo::with_revision(
+                repo.to_string(),
+                RepoType::Dataset,
+                revision.to_string(),
+            ))
+            .get(file)?;
+        let reader = SerializedFileReader::new(File::open(&path).wrap_err("opening code shard")?)
+            .wrap_err("opening parquet reader")?;
+        let idx = column_index(&reader, blob_column)?;
+
+        let mut blob_ids = Vec::with_capacity(max_files.min(1 << 16));
+        'outer: for g in 0..reader.num_row_groups() {
+            let group = reader.get_row_group(g).wrap_err("reading row group")?;
+            for record in group.get_row_iter(None).wrap_err("row iterator")? {
+                let row = record.wrap_err("decoding parquet row")?;
+                if let Ok(id) = row.get_string(idx) {
+                    blob_ids.push(id.clone());
+                    if blob_ids.len() >= max_files {
+                        break 'outer;
+                    }
+                }
+            }
+        }
+        Ok(Self { blob_ids })
+    }
+}
+
+/// Max blob fetches in flight at once against Software Heritage's S3.
+const SWH_CONCURRENCY: usize = 32;
+
+/// Process-wide async HTTP client for the SWH fetches, built once.
+fn swh_client() -> Result<&'static reqwest::Client> {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    if let Some(client) = CLIENT.get() {
+        return Ok(client);
+    }
+    let client = reqwest::Client::builder()
+        .build()
+        .wrap_err("building swh http client")?;
+    Ok(CLIENT.get_or_init(|| client))
+}
+
+/// Process-wide runtime that drives the async fetches. The streaming dataset's
+/// `group_texts` is a synchronous call, so it `block_on`s this runtime; the
+/// threads are never themselves inside a runtime, so blocking on it is safe.
+fn swh_runtime() -> Result<&'static tokio::runtime::Runtime> {
+    static RT: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+    if let Some(rt) = RT.get() {
+        return Ok(rt);
+    }
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()
+        .wrap_err("building swh runtime")?;
+    Ok(RT.get_or_init(|| rt))
+}
+
+/// Fetch one blob's content from Software Heritage's public S3 bucket and gunzip it.
+/// Objects are stored gzipped and served as `application/octet-stream` with no
+/// `Content-Encoding`, so the body is the raw gzip stream. Decoded lossily on purpose:
+/// Stack-Edu blobs span many source encodings, and the byte-level BPE tokenizer is
+/// encoding-agnostic — a stray replacement char is harmless and there is no canonical
+/// UTF-8 to "convert" arbitrary source bytes to.
+async fn fetch_one(client: &reqwest::Client, blob_id: &str) -> Result<String> {
+    let url = format!("https://softwareheritage.s3.amazonaws.com/content/{blob_id}");
+    let gz = client
+        .get(&url)
+        .send()
+        .await
+        .and_then(reqwest::Response::error_for_status)
+        .map_err(|e| eyre::eyre!("swh fetch {blob_id}: {e}"))?
+        .bytes()
+        .await
+        .wrap_err("reading swh response")?;
+    let mut bytes = Vec::new();
+    flate2::read::GzDecoder::new(&gz[..])
+        .read_to_end(&mut bytes)
+        .wrap_err("gunzip swh blob")?;
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// Fetch `blob_ids` concurrently (≤ `SWH_CONCURRENCY` in flight), preserving input order.
+fn fetch_swh_blobs(blob_ids: &[String]) -> Result<Vec<String>> {
+    let client = swh_client()?;
+    let out = swh_runtime()?.block_on(async move {
+        let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(SWH_CONCURRENCY));
+        let mut set = tokio::task::JoinSet::new();
+        for (i, id) in blob_ids.iter().cloned().enumerate() {
+            let client = client.clone();
+            let sem = sem.clone();
+            set.spawn(async move {
+                // The semaphore is never closed, so acquire can't really fail; if it
+                // somehow did, drop this blob rather than the whole group.
+                let Ok(_permit) = sem.acquire_owned().await else {
+                    return (i, String::new());
+                };
+                (i, fetch_one(&client, &id).await.unwrap_or_default())
+            });
+        }
+        let mut out = vec![String::new(); blob_ids.len()];
+        while let Some(joined) = set.join_next().await {
+            if let Ok((i, text)) = joined {
+                out[i] = text;
+            }
+        }
+        out
+    });
+    Ok(out)
+}
+
+impl RowGroupSource for SoftwareHeritageSource {
+    fn num_groups(&self) -> usize {
+        self.blob_ids.len().div_ceil(SWH_GROUP_SIZE).max(1)
+    }
+
+    fn group_texts(&self, g: usize) -> Result<Vec<String>> {
+        let start = g * SWH_GROUP_SIZE;
+        let end = (start + SWH_GROUP_SIZE).min(self.blob_ids.len());
+        if start >= end {
+            return Ok(Vec::new());
+        }
+        // One HTTP GET per blob, fetched concurrently; a failed fetch becomes an empty
+        // document instead of failing the run.
+        fetch_swh_blobs(&self.blob_ids[start..end])
+    }
+}
+
 /// Seekable streaming corpus: dense `seq_len+1` windows packed per row group,
 /// tokenized on demand with a bounded row-group cache. Cheap to clone (everything
 /// shared); a sub-range `view` carves disjoint train/valid splits that share the cache.
@@ -300,6 +388,66 @@ pub struct StreamingTokenDataset {
     seq_len: usize,
     offset: usize,
     len: usize,
+}
+
+/// Build parquet-shard sources for `files` from `repo`@`revision`, reading `text_column`.
+pub fn parquet_sources(
+    repo: &str,
+    revision: &str,
+    files: &[String],
+    text_column: &str,
+) -> Result<Vec<Box<dyn RowGroupSource>>> {
+    files
+        .iter()
+        .map(|f| {
+            Ok(
+                Box::new(ParquetShard::from_hub(repo, f, text_column, revision)?)
+                    as Box<dyn RowGroupSource>,
+            )
+        })
+        .collect()
+}
+
+/// Build Software-Heritage code sources for `files` from `repo`@`revision`.
+pub fn swh_sources(
+    repo: &str,
+    revision: &str,
+    files: &[String],
+    blob_column: &str,
+    max_files: usize,
+) -> Result<Vec<Box<dyn RowGroupSource>>> {
+    files
+        .iter()
+        .map(|f| {
+            Ok(Box::new(SoftwareHeritageSource::from_hub(
+                repo,
+                revision,
+                f,
+                blob_column,
+                max_files,
+            )?) as Box<dyn RowGroupSource>)
+        })
+        .collect()
+}
+
+/// Pull up to `max_docs` documents across `sources`, in order — the tokenizer-training
+/// sampler. (Pretraining instead wraps the same sources in a `StreamingTokenDataset`.)
+pub fn collect_docs(sources: &[Box<dyn RowGroupSource>], max_docs: usize) -> Result<Vec<String>> {
+    let mut out = Vec::new();
+    'outer: for src in sources {
+        for g in 0..src.num_groups() {
+            if out.len() >= max_docs {
+                break 'outer;
+            }
+            for doc in src.group_texts(g)? {
+                out.push(doc);
+                if out.len() >= max_docs {
+                    break 'outer;
+                }
+            }
+        }
+    }
+    Ok(out)
 }
 
 impl StreamingTokenDataset {
@@ -339,19 +487,23 @@ impl StreamingTokenDataset {
         })
     }
 
-    /// Fetch + open the listed FineWeb shards and build the dataset.
+    /// Fetch + open the listed parquet shards from `repo`@`revision` (reading `text_column`)
+    /// and build the dataset.
     pub fn from_hub(
         tokenizer: Arc<fastokens::Tokenizer>,
         repo: &str,
+        revision: &str,
         files: &[String],
+        text_column: &str,
         seq_len: usize,
         cache_groups: u64,
     ) -> Result<Self> {
-        let mut sources: Vec<Box<dyn RowGroupSource>> = Vec::with_capacity(files.len());
-        for file in files {
-            sources.push(Box::new(ParquetShard::from_hub(repo, file)?));
-        }
-        Self::new(sources, tokenizer, seq_len, cache_groups)
+        Self::new(
+            parquet_sources(repo, revision, files, text_column)?,
+            tokenizer,
+            seq_len,
+            cache_groups,
+        )
     }
 
     /// Total dense windows across all sources (before any `view`).
@@ -363,7 +515,7 @@ impl StreamingTokenDataset {
     }
 
     /// A sub-range view exposing global windows `range` as local indices, sharing the
-    /// same sources and cache. Used to split disjoint train/valid sets.
+    /// same sources and cache.
     pub fn view(&self, range: std::ops::Range<usize>) -> Self {
         let mut v = self.clone();
         v.offset = range.start;
@@ -371,7 +523,7 @@ impl StreamingTokenDataset {
         v
     }
 
-    /// Tokenize + concatenate one row group into its dense token stream (miss path).
+    /// Tokenize and concatenate one row group into its dense token stream.
     fn load_group(&self, group_idx: usize) -> Result<Arc<Vec<u32>>> {
         let gw = self.index[group_idx];
         let texts = self.sources[gw.source].group_texts(gw.group)?;
@@ -394,21 +546,148 @@ impl Dataset<Vec<i64>> for StreamingTokenDataset {
         }
         let (group_idx, local) = resolve_window(&self.index, self.offset + index)?;
         // Cache hit → clone the Arc'd token stream; miss → tokenize once and insert. A
-        // read error (corrupt shard) logs and drops the item rather than killing the run.
+        // read error logs and drops the item rather than killing the run.
         let stream = self
             .cache
             .try_get_with(group_idx as u64, || self.load_group(group_idx))
             .map_err(|e| eprintln!("streaming dataset: row group {group_idx} failed: {e}"))
             .ok()?;
-        // Dense window `local`: tokens [local*w .. local*w + w). The window index was
-        // built from this same stream's length, so the slice is always in bounds.
+        // Dense window `local`: tokens [local*w .. local*w + w). The window index is sized
+        // from the count pass; a non-deterministic source can reload a *shorter* stream than
+        // it counted, so a promised window may not fit. Drop it rather than panic.
         let w = self.seq_len + 1;
         let start = local * w;
-        Some(stream[start..start + w].iter().map(|&t| t as i64).collect())
+        stream
+            .get(start..start + w)
+            .map(|win| win.iter().map(|&t| t as i64).collect())
     }
 
     fn len(&self) -> usize {
         self.len
+    }
+}
+
+// --- Multi-stage data mix (decay anneal) ---
+//
+// Vary the domain mix over training instead of one static blend: web-heavy early, then
+// upweight math/code over the cosine-LR decay tail, following SmolLM3's multi-stage recipe.
+// The mechanism is a `MixtureDataset` wrapping one `StreamingTokenDataset` per domain plus a
+// shared atomic counter of items drawn; each `get` reads the current progress fraction,
+// interpolates the domain weights for it, picks a domain, and draws a window from it.
+// This composes with `SamplerDataset` + Burn's `SupervisedTraining` (which owns the epoch
+// loop) without a custom training loop. Progress is approximate — worker prefetch runs a
+// little ahead, and a resume restarts the counter — but the ramp is coarse, so neither
+// matters. The held-out valid set stays a single fixed domain (see `pretrain`) so the
+// metric is comparable across the run.
+
+/// Pick an index in `0..weights.len()` by the unnormalized `weights`, using a uniform
+/// `u ∈ [0,1)`. Empty/zero weights resolve to domain 0.
+fn pick_domain(weights: &[f64], u: f64) -> usize {
+    let total: f64 = weights.iter().sum();
+    if total <= 0.0 {
+        return 0;
+    }
+    let target = u * total;
+    let mut acc = 0.0;
+    for (i, w) in weights.iter().enumerate() {
+        acc += w;
+        if target < acc {
+            return i;
+        }
+    }
+    weights.len() - 1
+}
+
+/// Domain mix weights as a function of training progress: a constant `stable` blend until
+/// `decay_start`, then a linear ramp to the `decay` blend by the end. Both weight vectors
+/// are indexed by domain in the same order as `MixtureDataset::new`'s `domains`.
+#[derive(Clone, Debug)]
+pub struct MixSchedule {
+    stable: Vec<f64>,
+    decay: Vec<f64>,
+    decay_start: f64,
+}
+
+impl MixSchedule {
+    /// `decay_start` is the progress fraction (`0.0..1.0`) where the ramp begins; before
+    /// it the mix is `stable`, at progress 1.0 the mix is `decay`.
+    pub fn new(stable: Vec<f64>, decay: Vec<f64>, decay_start: f64) -> Self {
+        debug_assert_eq!(
+            stable.len(),
+            decay.len(),
+            "stable/decay domain counts differ"
+        );
+        Self {
+            stable,
+            decay,
+            decay_start: decay_start.clamp(0.0, 1.0),
+        }
+    }
+
+    /// Per-domain weights at `progress ∈ [0,1]`, linearly interpolated over the decay tail.
+    pub fn weights_at(&self, progress: f64) -> Vec<f64> {
+        let t = if progress <= self.decay_start {
+            0.0
+        } else {
+            ((progress - self.decay_start) / (1.0 - self.decay_start).max(f64::EPSILON))
+                .clamp(0.0, 1.0)
+        };
+        self.stable
+            .iter()
+            .zip(&self.decay)
+            .map(|(s, d)| s + (d - s) * t)
+            .collect()
+    }
+}
+
+/// A progress-weighted mixture over per-domain streaming corpora.
+#[derive(Clone)]
+pub struct MixtureDataset {
+    domains: Vec<StreamingTokenDataset>,
+    schedule: MixSchedule,
+    consumed: Arc<AtomicU64>,
+    total: u64,
+    len: usize,
+}
+
+impl MixtureDataset {
+    pub fn new(
+        domains: Vec<StreamingTokenDataset>,
+        schedule: MixSchedule,
+        total_draws: u64,
+    ) -> Self {
+        let len = domains.iter().map(|d| d.len()).sum();
+        Self {
+            domains,
+            schedule,
+            consumed: Arc::new(AtomicU64::new(0)),
+            total: total_draws.max(1),
+            len,
+        }
+    }
+}
+
+impl Dataset<Vec<i64>> for MixtureDataset {
+    fn get(&self, index: usize) -> Option<Vec<i64>> {
+        let step = self.consumed.fetch_add(1, Ordering::Relaxed);
+        let progress = (step as f64 / self.total as f64).min(1.0);
+        let weights = self.schedule.weights_at(progress);
+
+        // Seed a PRNG from the (already-shuffled) sampler index so a draw stays a
+        // deterministic function of `index`: one uniform picks the domain, the next a
+        // window within it.
+        let mut rng = fastrand::Rng::with_seed(index as u64);
+        let d = pick_domain(&weights, rng.f64());
+        let dom = &self.domains[d];
+        let dlen = dom.len();
+        if dlen == 0 {
+            return None;
+        }
+        dom.get(rng.usize(0..dlen))
+    }
+
+    fn len(&self) -> usize {
+        self.len.max(1)
     }
 }
 
@@ -433,52 +712,74 @@ impl<B: Backend> Batcher<B, Vec<i64>, Batch<B>> for TokenBatcher {
 // SFT: instruction tuning
 // ===========================================================================
 
-/// Load SFT `(prompt, response)` pairs from the OpenAssistant oasst_top1 parquet
-/// (human-written, Apache-2.0). Each row's `text` is an already-ChatML thread
-/// (`<|im_start|>user…<|im_end|>…<|im_start|>assistant…`); we take the **first**
-/// user→assistant exchange (single-turn is plenty at this scale).
-pub fn load_sft_pairs(repo: &str, file: &str, max: usize) -> Result<Vec<(String, String)>> {
+/// Load OpenAssistant oasst_top1 conversations, up to `max` threads. Each row's `text` is
+/// an already-ChatML thread (`<|im_start|>{role}\n…<|im_end|>`, the dataset's own format,
+/// parsed as-is); rendering into our template happens in [`build_sft_rows`].
+pub fn load_sft_threads(
+    repo: &str,
+    file: &str,
+    max: usize,
+) -> Result<Vec<Vec<crate::chat::Message>>> {
     let reader = open_hub_dataset_parquet(repo, file)?;
     let text = column_index(&reader, "text")?;
     read_rows(&reader, max, |row| {
         // A row with no readable text column is skipped, not fatal.
-        Ok(row.get_string(text).ok().and_then(|t| oasst_first_pair(t)))
+        Ok(row
+            .get_string(text)
+            .ok()
+            .map(|t| oasst_thread(t))
+            .filter(|turns| !turns.is_empty()))
     })
 }
 
-/// Extract the first `(user, assistant)` exchange from an oasst_top1 `text` thread —
-/// already ChatML (`<|im_start|>user\n…<|im_end|>…<|im_start|>assistant\n…`).
-fn oasst_first_pair(text: &str) -> Option<(String, String)> {
-    let user = chatml_turn(text, "<|im_start|>user\n")?;
-    let assistant = chatml_turn(text, "<|im_start|>assistant\n")?;
-    (!user.is_empty() && !assistant.is_empty()).then_some((user, assistant))
+/// Parse an oasst_top1 `text` thread into ordered turns. The dataset delimits turns with
+/// `<|im_start|>{role}\n…<|im_end|>`; we map `user`/`assistant`/`system` to roles and drop
+/// empty or unknown-role turns.
+fn oasst_thread(text: &str) -> Vec<crate::chat::Message> {
+    use crate::chat::Message;
+    let mut turns = Vec::new();
+    let mut rest = text;
+    while let Some(open) = rest.find("<|im_start|>") {
+        let after = &rest[open + "<|im_start|>".len()..];
+        let Some(nl) = after.find('\n') else { break };
+        let role = after[..nl].trim();
+        let body = &after[nl + 1..];
+        let end = body.find("<|im_end|>").unwrap_or(body.len());
+        let content = body[..end].trim().to_string();
+        if !content.is_empty() {
+            match role {
+                "user" => turns.push(Message::user(content)),
+                "assistant" => turns.push(Message::assistant(content)),
+                "system" => turns.push(Message::system(content)),
+                _ => {}
+            }
+        }
+        rest = &body[end..];
+    }
+    turns
 }
 
-/// Content of the first turn opened by `open`, up to its `<|im_end|>`.
-fn chatml_turn(text: &str, open: &str) -> Option<String> {
-    let rest = &text[text.find(open)? + open.len()..];
-    let end = rest.find("<|im_end|>").unwrap_or(rest.len());
-    Some(rest[..end].trim().to_string())
-}
-
-/// Build one padded SFT row `(inputs, targets)` of length `seq_len`: the ChatML
-/// sequence, with prompt and pad target positions set to `IGNORE_ID` so the loss only
-/// sees the assistant response.
-pub fn build_sft_row(
+/// Build a padded `(inputs, targets)` row of length `seq_len` that trains only on
+/// `response`: the conversation `history` plus the open model turn is the `IGNORE_ID`-masked
+/// prefix, and the response with its closing `<turn|>` are the supervised targets.
+/// `render(history, true)` is a token prefix of the full render, which the masking relies on.
+fn build_masked_row(
     tok: &fastokens::Tokenizer,
-    prompt: &str,
+    history: &[crate::chat::Message],
     response: &str,
     seq_len: usize,
 ) -> Result<(Vec<i64>, Vec<i64>)> {
     let ignore = crate::chat::IGNORE_ID as i64;
+    let mut convo = history.to_vec();
+    convo.push(crate::chat::Message::assistant(response));
     let full: Vec<i64> = tok
-        .encode(&crate::chat::render_full(prompt, response))
+        .encode(&crate::chat::render(&convo, false))
         .wrap_err("encoding sft example")?
         .into_iter()
         .map(|x| x as i64)
         .collect();
     let prompt_len = tok
-        .encode(&crate::chat::render_prompt(prompt))
+        .encode(&crate::chat::render(history, true))
         .wrap_err("encoding sft prompt")?
         .len();
 
@@ -497,8 +798,39 @@ pub fn build_sft_row(
     Ok((inputs, targets))
 }
 
-/// Pre-tokenized SFT rows; the trivial batcher just stacks them (tokenization happens
-/// once up front, so this stays `Send + Sync` for the dataloader).
+/// Build one padded row from a single-turn `(prompt, response)`. Used by DPO; a thin wrapper
+/// over [`build_masked_row`] with a one-message user history.
+pub fn build_sft_row(
+    tok: &fastokens::Tokenizer,
+    prompt: &str,
+    response: &str,
+    seq_len: usize,
+) -> Result<(Vec<i64>, Vec<i64>)> {
+    build_masked_row(
+        tok,
+        &[crate::chat::Message::user(prompt)],
+        response,
+        seq_len,
+    )
+}
+
+/// Build SFT rows from a full conversation: one cumulative-context row per model turn, so
+/// every assistant response in the thread is trained on with all of its prior context.
+pub fn build_sft_rows(
+    tok: &fastokens::Tokenizer,
+    conv: &[crate::chat::Message],
+    seq_len: usize,
+) -> Result<Vec<(Vec<i64>, Vec<i64>)>> {
+    let mut rows = Vec::new();
+    for (i, m) in conv.iter().enumerate() {
+        if m.role == crate::chat::Role::Model && !m.content.is_empty() {
+            rows.push(build_masked_row(tok, &conv[..i], &m.content, seq_len)?);
+        }
+    }
+    Ok(rows)
+}
+
+/// Pre-tokenized SFT rows.
 #[derive(Clone)]
 pub struct SftDataset {
     rows: Vec<(Vec<i64>, Vec<i64>)>,
@@ -562,9 +894,7 @@ pub fn load_dpo_triples(
 }
 
 /// One DPO example: response-masked `(input, target)` rows for the chosen and rejected
-/// continuations. The frozen-reference log-probs are computed inline in the train step,
-/// not precomputed — at 1-2 epochs a cache costs a full upfront reference pass for no
-/// saving.
+/// continuations.
 #[derive(Clone, Debug)]
 pub struct DpoExample {
     pub chosen: (Vec<i64>, Vec<i64>),
@@ -592,7 +922,7 @@ impl Dataset<DpoExample> for DpoDataset {
 }
 
 /// A DPO batch: chosen/rejected response-masked sequences `[B, L]`. The reference
-/// log-probs are computed inside the train step (see `dpo::DpoModel`), not carried here.
+/// log-probs are computed inside the train step, not carried here.
 #[derive(Clone, Debug)]
 pub struct DpoBatch<B: Backend> {
     pub chosen_in: Tensor<B, 2, Int>,
@@ -648,7 +978,7 @@ pub fn load_gsm8k(repo: &str, file: &str, max: usize) -> Result<Vec<(String, Str
     })
 }
 
-/// One GRPO example: a tokenized prompt and its verifiable (integer) answer.
+/// One GRPO example: a tokenized prompt and its verifiable answer.
 #[derive(Clone, Debug)]
 pub struct GrpoExample {
     pub prompt: Vec<i64>,
@@ -716,14 +1046,35 @@ impl<B: Backend> Batcher<B, GrpoExample, GrpoBatch> for GrpoBatcher {
 mod tests {
     use super::*;
 
+    fn fixture_tokenizer() -> fastokens::Tokenizer {
+        let json = serde_json::from_str(include_str!("../testdata/tokenizer.json"))
+            .expect("fixture tokenizer json");
+        fastokens::Tokenizer::from_json(json).expect("loading fixture tokenizer")
+    }
+
     #[test]
-    fn oasst_pair_parses_first_chatml_exchange() {
+    fn oasst_thread_parses_all_turns() {
+        use crate::chat::Role;
         let text = "<|im_start|>user\nName 3 dogs<|im_end|>\n<|im_start|>assistant\nRex, Fido, Spot<|im_end|>\n<|im_start|>user\nmore<|im_end|>\n";
+        let turns = oasst_thread(text);
         assert_eq!(
-            oasst_first_pair(text),
-            Some(("Name 3 dogs".to_string(), "Rex, Fido, Spot".to_string()))
+            turns.len(),
+            3,
+            "all three turns parsed, not just the first pair"
         );
-        assert_eq!(oasst_first_pair("no markers here"), None);
+        assert_eq!(
+            (turns[0].role, turns[0].content.as_str()),
+            (Role::User, "Name 3 dogs")
+        );
+        assert_eq!(
+            (turns[1].role, turns[1].content.as_str()),
+            (Role::Model, "Rex, Fido, Spot")
+        );
+        assert_eq!(
+            (turns[2].role, turns[2].content.as_str()),
+            (Role::User, "more")
+        );
+        assert!(oasst_thread("no markers here").is_empty());
     }
 
     #[test]
@@ -797,7 +1148,7 @@ mod tests {
         // Real tokenizer so encode_batch matches production; ASCII letters tokenize to
         // stable ids. Two groups of docs; we only assert structural properties (dense,
         // seekable, disjoint views) that hold regardless of the exact ids.
-        let tok = Arc::new(load_tokenizer(crate::constants::TOKENIZER_REPO).unwrap());
+        let tok = Arc::new(fixture_tokenizer());
         let seq_len = 7;
         let w = seq_len + 1;
         // Documents long enough that each group concatenates to several full windows.
@@ -834,5 +1185,138 @@ mod tests {
                 "valid view offset maps to global a"
             );
         }
+    }
+
+    #[test]
+    fn streaming_tolerates_a_group_that_shrinks_on_reload() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // A source whose group yields fewer tokens on reload than during the count pass —
+        // exactly the SoftwareHeritage flaky-fetch case (a fetch that succeeds while counting
+        // fails on reload → empty doc → fewer tokens). The window index is sized from the
+        // count pass, so `get` must not slice past the shortened reloaded stream. Regression:
+        // panic `range start index .. out of range for slice of length ..` at `get`.
+        struct ShrinkingSource {
+            calls: AtomicUsize,
+            long: String,
+            short: String,
+        }
+        impl RowGroupSource for ShrinkingSource {
+            fn num_groups(&self) -> usize {
+                1
+            }
+            fn group_texts(&self, _g: usize) -> Result<Vec<String>> {
+                // First call (the count pass) sees the long doc; every reload sees the short.
+                let n = self.calls.fetch_add(1, Ordering::Relaxed);
+                Ok(vec![if n == 0 {
+                    self.long.clone()
+                } else {
+                    self.short.clone()
+                }])
+            }
+        }
+
+        let tok = Arc::new(fixture_tokenizer());
+        let seq_len = 7;
+        let para = "the quick brown fox jumps over the lazy dog again and again ";
+        let ds = StreamingTokenDataset::new(
+            vec![Box::new(ShrinkingSource {
+                calls: AtomicUsize::new(0),
+                long: para.repeat(8),    // many windows during the count pass
+                short: para.to_string(), // far fewer tokens on reload
+            })],
+            tok,
+            seq_len,
+            8,
+        )
+        .unwrap();
+
+        // The index promised more windows than the reload can fill. Every `get` must return
+        // a full window or `None` — never panic.
+        for i in 0..ds.len() {
+            if let Some(win) = ds.get(i) {
+                assert_eq!(win.len(), seq_len + 1, "returned window must be full width");
+            }
+        }
+    }
+
+    #[test]
+    fn mix_schedule_ramps_stable_to_decay() {
+        let s = MixSchedule::new(vec![0.85, 0.15], vec![0.5, 0.5], 0.8);
+        assert_eq!(s.weights_at(0.0), vec![0.85, 0.15]); // stable before the tail
+        assert_eq!(s.weights_at(0.8), vec![0.85, 0.15]); // ramp begins at decay_start
+        let mid = s.weights_at(0.9); // halfway through the 0.8..1.0 tail
+        assert!(
+            (mid[0] - 0.675).abs() < 1e-9 && (mid[1] - 0.325).abs() < 1e-9,
+            "{mid:?}"
+        );
+        let end = s.weights_at(1.0);
+        assert!(
+            (end[0] - 0.5).abs() < 1e-9 && (end[1] - 0.5).abs() < 1e-9,
+            "{end:?}"
+        );
+    }
+
+    #[test]
+    fn pick_domain_respects_weights() {
+        assert_eq!(pick_domain(&[1.0, 0.0, 0.0], 0.99), 0);
+        assert_eq!(pick_domain(&[0.0, 0.0, 1.0], 0.0), 2);
+        assert_eq!(pick_domain(&[0.0, 0.0, 1.0], 0.99), 2);
+        // 50/50: low u falls in the first half, high u in the second.
+        assert_eq!(pick_domain(&[0.5, 0.5], 0.1), 0);
+        assert_eq!(pick_domain(&[0.5, 0.5], 0.9), 1);
+        // Degenerate all-zero weights resolve to domain 0.
+        assert_eq!(pick_domain(&[0.0, 0.0], 0.5), 0);
+    }
+
+    #[test]
+    fn mixture_routes_draws_by_domain_weight() {
+        let tok = Arc::new(fixture_tokenizer());
+        let seq_len = 7;
+        let para = "the quick brown fox jumps over the lazy dog again and again ";
+        let web = StreamingTokenDataset::new(
+            vec![Box::new(FakeSource {
+                groups: vec![vec![para.repeat(4)]],
+            })],
+            tok.clone(),
+            seq_len,
+            8,
+        )
+        .unwrap();
+        // A domain whose only doc is too short to fill one window → 0 windows.
+        let empty = StreamingTokenDataset::new(
+            vec![Box::new(FakeSource {
+                groups: vec![vec!["a".to_string()]],
+            })],
+            tok.clone(),
+            seq_len,
+            8,
+        )
+        .unwrap();
+        assert!(
+            web.len() > 0 && empty.len() == 0,
+            "fixture domains malformed"
+        );
+
+        // All weight on web → every draw is a full web window.
+        let all_web = MixtureDataset::new(
+            vec![web.clone(), empty.clone()],
+            MixSchedule::new(vec![1.0, 0.0], vec![1.0, 0.0], 0.8),
+            100,
+        );
+        for i in 0..20 {
+            assert_eq!(all_web.get(i).expect("web draw").len(), seq_len + 1);
+        }
+
+        // All weight on the empty domain → every draw routes there and yields None.
+        let all_empty = MixtureDataset::new(
+            vec![web, empty],
+            MixSchedule::new(vec![0.0, 1.0], vec![0.0, 1.0], 0.8),
+            100,
+        );
+        assert!(
+            (0..20).all(|i| all_empty.get(i).is_none()),
+            "empty-domain draws must be None"
+        );
     }
 }
