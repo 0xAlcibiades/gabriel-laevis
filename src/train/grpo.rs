@@ -388,14 +388,13 @@ pub fn run(
         .num_epochs(sched.ckpt_epochs)
         .summary();
 
-    // Auto-resume from the latest checkpoint in the stage dir unless `--from` was given
-    // (which starts fresh from the named weights). Mirrors pretrain.
-    let training = match (from, ctx.latest_checkpoint_epoch(&grpo_dir)) {
-        (Some(_), _) | (None, None) => training,
-        (None, Some(e)) => {
+    // Auto-resume from the latest checkpoint in the stage dir unless `--from` was given.
+    let training = match ctx.resume_epoch(from, &grpo_dir) {
+        Some(e) => {
             println!("resuming grpo from checkpoint epoch {e}");
             training.checkpoint(e)
         }
+        None => training,
     };
 
     let result = training.launch(Learner::new(model, AdamConfig::new().init(), LR));

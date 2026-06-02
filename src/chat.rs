@@ -8,13 +8,13 @@
 //!   before the content.
 //!
 //! TODO:
-//! The tokenizer reserves the full modern control-token set (tool-calling, image/audio/video);
-//! only the text + thinking path is rendered here. This needs an update accordingly.
+//! Only the text + thinking path is rendered today. The other reserved control tokens
+//! (tool-calling, image/audio/video — see [`SpecialToken`]) are kept in the vocab on purpose
+//! so adding those capabilities later needs no from-scratch re-pretrain; their rendering
+//! lands with the tool-use loop / multimodal work.
 
 /// The reserved special-token vocabulary, in id order. `train::tokenizer` reserves these in
-/// exactly this declaration order, so each variant's discriminant *is* its vocab id. One
-/// enum shared by tokenizer training, the id constants below, and rendering — so they can't
-/// drift apart.
+/// exactly this declaration order, so each variant's discriminant is its vocab id.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, strum::EnumIter)]
 pub enum SpecialToken {
     Pad,

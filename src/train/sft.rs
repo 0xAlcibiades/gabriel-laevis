@@ -79,16 +79,12 @@ pub fn run(
         .summary();
 
     // Auto-resume from the latest checkpoint in the stage dir unless `--from` was given.
-    let epoch_to_resume = from
-        .is_none()
-        .then(|| ctx.latest_checkpoint_epoch(&sft_dir))
-        .flatten();
-
-    let training = if let Some(e) = epoch_to_resume {
-        println!("resuming sft from checkpoint epoch {e}");
-        training.checkpoint(e)
-    } else {
-        training
+    let training = match ctx.resume_epoch(from, &sft_dir) {
+        Some(e) => {
+            println!("resuming sft from checkpoint epoch {e}");
+            training.checkpoint(e)
+        }
+        None => training,
     };
 
     let result = training.launch(Learner::new(model, AdamConfig::new().init(), LR));

@@ -57,6 +57,11 @@ impl<B: Backend> GabrielLaevis<B> {
         self.embed.weight.val().device()
     }
 
+    /// The tied output head: the embedding table transposed to `[d_model, vocab]`.
+    fn head_weight(&self) -> Tensor<B, 2> {
+        self.embed.weight.val().swap_dims(0, 1)
+    }
+
     /// `tokens: [B, T]` (Int) → `logits: [B, T, vocab]`.
     pub fn forward(&self, tokens: Tensor<B, 2, Int>) -> Tensor<B, 3> {
         let [b, t] = tokens.dims();
@@ -67,7 +72,7 @@ impl<B: Backend> GabrielLaevis<B> {
         let x = self.norm.forward(x);
         let dm = x.dims()[2];
         // Tied head: logits = x · Wᵀ, where W is the embedding table [vocab, d_model].
-        let w_t = self.embed.weight.val().swap_dims(0, 1); // [d_model, vocab]
+        let w_t = self.head_weight(); // [d_model, vocab]
         let logits = x.reshape([b * t, dm]).matmul(w_t); // [B*T, vocab]
         logits.reshape([b, t, self.vocab_size])
     }
@@ -89,7 +94,7 @@ impl<B: Backend> GabrielLaevis<B> {
         }
         let x = self.norm.forward(x);
         let dm = x.dims()[2];
-        let w_t = self.embed.weight.val().swap_dims(0, 1);
+        let w_t = self.head_weight();
         let logits = x.reshape([1, dm]).matmul(w_t).reshape([self.vocab_size]);
         (logits, next_states)
     }
@@ -117,7 +122,7 @@ impl<B: Backend> GabrielLaevis<B> {
         let dm = x.dims()[2];
         // Only the last timestep's hidden feeds the next-token logits.
         let last = x.slice([0..1, t - 1..t, 0..dm]).reshape([1, dm]);
-        let w_t = self.embed.weight.val().swap_dims(0, 1);
+        let w_t = self.head_weight();
         let logits = last.matmul(w_t).reshape([self.vocab_size]);
         (logits, states)
     }

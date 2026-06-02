@@ -101,9 +101,8 @@ impl<B: Backend> Mamba3State<B> {
     }
 }
 
-/// Mamba 3 Block State
+/// The Mamba-3 (SISO) mixer block.
 ///
-/// NOTE:
 /// All seven per-step input projections share the same input `u` and the same fan-in
 /// (d_model), so they are fused into one `d_model -> proj_out` matmul and sliced in
 /// `project` (one GEMM/launch per block instead of seven; KaimingUniform keys off
@@ -270,10 +269,8 @@ impl<B: Backend> Mamba3Block<B> {
         }
     }
 
-    /// Expand per-group B/C `[B, T, ngroups, N]` to per-head `[B, nheads, T, N]`
-    /// and apply the half-RoPE by the shared cumulative phase `phi` `[B, T, na]`.
-    ///
-    /// TODO: half-RoPE occurs a few times, could be DRYed
+    /// Expand per-group B/C `[B, T, ngroups, N]` to per-head `[B, nheads, T, N]` and apply the
+    /// half-RoPE by the shared cumulative phase `phi` `[B, T, na]`.
     fn rope_heads(&self, bc: Tensor<B, 4>, phi: Tensor<B, 3>) -> Tensor<B, 4> {
         let [b, t, g, n] = bc.dims();
         let nh = self.nheads;
@@ -519,17 +516,13 @@ impl<B: Backend> Mamba3Block<B> {
 
     /// One recurrent step for cached generation: `[B,1,d_model]` + state →
     /// (`[B,1,d_model]`, next state).
-    ///
-    /// TODO: The same per-head recurrence as `scan`. Could be DRYed.
     pub fn step(&self, u: Tensor<B, 3>, state: Mamba3State<B>) -> (Tensor<B, 3>, Mamba3State<B>) {
         let [b, _, _] = u.dims();
         let di = self.d_inner;
         let n = self.d_state;
         let nh = self.nheads;
         let hp = self.headdim;
-        let g = self.ngroups;
         let na = self.num_rope_angles;
-        let rd = 2 * na;
 
         let co = self.project(u);
         // Per-head, per-channel scalars (T = 1).
@@ -542,32 +535,13 @@ impl<B: Backend> Mamba3Block<B> {
         let z = co.z.reshape([b, di]);
         let theta = co.theta.reshape([b, na]);
 
-        let phi = state.phi.add(theta); // [B,na]
-        // Per-head B/C (group → head), then half-RoPE by the shared phi.
-        //
-        // TODO: Occurs a few times, could be DRYed
-        let to_heads = |bc: Tensor<B, 4>| {
-            bc.reshape([b, g, n])
-                .unsqueeze_dim::<4>(2)
-                .expand([b, g, nh / g, n])
-                .reshape([b, nh, n]) // [B,nh,N]
-        };
-        let rotate = |full: Tensor<B, 3>| {
-            let head = full.clone().slice([0..b, 0..nh, 0..rd]);
-            let phih = phi
-                .clone()
-                .unsqueeze_dim::<3>(1)
-                .expand([b, nh, na])
-                .reshape([b * nh, na]);
-            let rot = rotate_pairs(head.reshape([b * nh, na, 2]), phih).reshape([b, nh, rd]);
-            if rd == n {
-                rot
-            } else {
-                Tensor::cat(vec![rot, full.slice([0..b, 0..nh, rd..n])], 2)
-            }
-        };
-        let b_rot = rotate(to_heads(co.b)); // [B,nh,N]
-        let c_rot = rotate(to_heads(co.c));
+        let phi = state.phi.add(theta); // [B,na] cumulative rotation phase
+        // Per-head B/C: group → head + half-RoPE by the cumulative phase, shared with the scan
+        // path via `rope_heads`. Here T = 1, so wrap phi in a length-1 time axis and squeeze
+        // the time axis back out of the result.
+        let phi_seq = phi.clone().reshape([b, 1, na]);
+        let b_rot = self.rope_heads(co.b, phi_seq.clone()).reshape([b, nh, n]); // [B,nh,N]
+        let c_rot = self.rope_heads(co.c, phi_seq).reshape([b, nh, n]);
 
         // h = α⊙h + (γ·x)⊗B + (β·x_prev)⊗B_prev, per head [B,nh,hp,N].
         let h_prev = state.h.reshape([b, nh, hp, n]);

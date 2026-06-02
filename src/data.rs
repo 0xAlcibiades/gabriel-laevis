@@ -308,10 +308,10 @@ fn swh_runtime() -> Result<&'static tokio::runtime::Runtime> {
 
 /// Fetch one blob's content from Software Heritage's public S3 bucket and gunzip it.
 /// Objects are stored gzipped and served as `application/octet-stream` with no
-/// `Content-Encoding`, so the body is the raw gzip stream.
-///
-/// TODO: Bytes are decoded lossily because Stack-Edu spans many source encodings
-///       likely should convert to utf-8.
+/// `Content-Encoding`, so the body is the raw gzip stream. Decoded lossily on purpose:
+/// Stack-Edu blobs span many source encodings, and the byte-level BPE tokenizer is
+/// encoding-agnostic — a stray replacement char is harmless and there is no canonical
+/// UTF-8 to "convert" arbitrary source bytes to.
 async fn fetch_one(client: &reqwest::Client, blob_id: &str) -> Result<String> {
     let url = format!("https://softwareheritage.s3.amazonaws.com/content/{blob_id}");
     let gz = client

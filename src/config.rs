@@ -91,11 +91,8 @@ impl Default for ModelConfig {
     }
 }
 
-/// Output, checkpoint, and token-cache directory. Set `MODEL_DIR` to override the
-/// default.
-///
-/// In contra, dataset and downloads use the standard Hugging Face cache
-/// under `HF_HOME`.
+/// Output, checkpoint, and token-cache directory. Set `MODEL_DIR` to override the default.
+/// Dataset downloads, by contrast, use the standard Hugging Face cache under `HF_HOME`.
 pub fn artifact_dir() -> PathBuf {
     std::env::var_os("MODEL_DIR")
         .map(PathBuf::from)

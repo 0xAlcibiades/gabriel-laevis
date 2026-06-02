@@ -230,12 +230,12 @@ pub fn run(
         .num_epochs(sched.ckpt_epochs)
         .summary();
 
-    let training = match (from, ctx.latest_checkpoint_epoch(&dpo_dir)) {
-        (Some(_), _) | (None, None) => training,
-        (None, Some(e)) => {
+    let training = match ctx.resume_epoch(from, &dpo_dir) {
+        Some(e) => {
             println!("resuming dpo from checkpoint epoch {e}");
             training.checkpoint(e)
         }
+        None => training,
     };
 
     let result = training.launch(Learner::new(model, AdamConfig::new().init(), LR));

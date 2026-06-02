@@ -52,7 +52,7 @@ impl<B: Backend> GabrielLaevis<B> {
         }
         let x = self.norm.forward(x);
         let dm = x.dims()[2];
-        let w_t = self.embed.weight.val().swap_dims(0, 1);
+        let w_t = self.head_weight();
         let logits = x.reshape([g, dm]).matmul(w_t); // [g, vocab]
         (logits, next_states)
     }

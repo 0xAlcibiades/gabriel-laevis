@@ -183,18 +183,13 @@ pub fn run(
         .num_epochs(sched.ckpt_epochs)
         .summary();
 
-    // Auto-resume from the latest checkpoint in the artifact dir unless `--from` was
-    // given.
-    let epoch_to_resume = from
-        .is_none()
-        .then(|| ctx.latest_checkpoint_epoch(&ctx.artifact))
-        .flatten();
-
-    let training = if let Some(e) = epoch_to_resume {
-        println!("resuming from checkpoint epoch {e}");
-        training.checkpoint(e)
-    } else {
-        training
+    // Auto-resume from the latest checkpoint in the artifact dir unless `--from` was given.
+    let training = match ctx.resume_epoch(from, &ctx.artifact) {
+        Some(e) => {
+            println!("resuming from checkpoint epoch {e}");
+            training.checkpoint(e)
+        }
+        None => training,
     };
 
     let result = training.launch(Learner::new(model, optim, lr));

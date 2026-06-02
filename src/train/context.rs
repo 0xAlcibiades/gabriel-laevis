@@ -62,6 +62,15 @@ impl TrainingContext {
             .max()
     }
 
+    /// Checkpoint epoch to resume from: the latest in `dir`, or `None` to start fresh —
+    /// `None` whenever `--from` was given (which starts a fresh schedule from named weights).
+    pub fn resume_epoch(&self, from: Option<&str>, dir: impl AsRef<Path>) -> Option<usize> {
+        if from.is_some() {
+            return None;
+        }
+        self.latest_checkpoint_epoch(dir)
+    }
+
     /// A fresh model on the autodiff backend.
     pub fn fresh_model(&self, cfg: &ModelConfig) -> GabrielLaevis<crate::Train> {
         GabrielLaevis::new(cfg, &self.device)
