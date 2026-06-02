@@ -580,18 +580,6 @@ impl Dataset<Vec<i64>> for StreamingTokenDataset {
 // matters. The held-out valid set stays a single fixed domain (see `pretrain`) so the
 // metric is comparable across the run.
 
-// TODO: Just use fastrand
-
-/// SplitMix64: turn the (already-random) sampler index into two independent uniform
-/// streams — one to pick the domain, one to pick a window within it.
-fn splitmix64(mut x: u64) -> u64 {
-    x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
-    let mut z = x;
-    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-    z ^ (z >> 31)
-}
-
 /// Pick an index in `0..weights.len()` by the unnormalized `weights`, using a uniform
 /// `u ∈ [0,1)`. Empty/zero weights resolve to domain 0.
 fn pick_domain(weights: &[f64], u: f64) -> usize {
@@ -685,16 +673,17 @@ impl Dataset<Vec<i64>> for MixtureDataset {
         let progress = (step as f64 / self.total as f64).min(1.0);
         let weights = self.schedule.weights_at(progress);
 
-        let h = splitmix64(index as u64);
-        let u = (h >> 11) as f64 / (1u64 << 53) as f64; // uniform [0,1)
-        let d = pick_domain(&weights, u);
+        // Seed a PRNG from the (already-shuffled) sampler index so a draw stays a
+        // deterministic function of `index`: one uniform picks the domain, the next a
+        // window within it.
+        let mut rng = fastrand::Rng::with_seed(index as u64);
+        let d = pick_domain(&weights, rng.f64());
         let dom = &self.domains[d];
         let dlen = dom.len();
         if dlen == 0 {
             return None;
         }
-        let w = (splitmix64(h ^ 0xD1B5_4A32_D192_ED03) as usize) % dlen;
-        dom.get(w)
+        dom.get(rng.usize(0..dlen))
     }
 
     fn len(&self) -> usize {
