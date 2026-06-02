@@ -3,58 +3,17 @@
 // exceed the default recursion limit during trait resolution.
 #![recursion_limit = "256"]
 
+pub mod backend;
 pub mod chat;
 pub mod config;
 pub mod constants;
-pub mod data;
 pub mod model;
+pub mod utils;
+pub use backend::{Compute, Elem};
+
+#[cfg(feature = "train")]
+pub use backend::Train;
+#[cfg(feature = "train")]
+pub mod data;
+#[cfg(feature = "train")]
 pub mod train;
-
-// TODO: This is somewhat of a mess, we don't need to case, we could let
-// burn handle this for us and simplify the crate structure drastically.
-
-// Float element: bf16 (feature) or f32. The whole model — scan included — runs in
-// `Elem`; there is no internal f32 cast. bf16 is fine for the scan: it has the same
-// 8-bit exponent as f32 (identical dynamic range), the chunked decay is segment-summed
-// in log space and masked before exp (overflow-free, no catastrophic cancellation), and
-// on CUDA the matmuls accumulate in f32 on the tensor cores regardless of bf16 storage.
-// bf16 is a no-op on CPU (f32-only) and broken on Metal (cubecl MSL codegen emits an
-// invalid float→bfloat cast for exp/log), so it's CUDA-only: `--features cuda,bf16`.
-#[cfg(all(
-    feature = "bf16",
-    any(feature = "cuda", feature = "metal", feature = "wgpu")
-))]
-pub type Elem = burn::tensor::bf16;
-#[cfg(not(all(
-    feature = "bf16",
-    any(feature = "cuda", feature = "metal", feature = "wgpu")
-)))]
-pub type Elem = f32;
-
-// Selected compute backend (cuda > metal > wgpu > cpu) and its autodiff wrapper.
-#[cfg(feature = "cuda")]
-pub type Compute = burn::backend::Cuda<Elem>;
-#[cfg(all(feature = "metal", not(feature = "cuda")))]
-pub type Compute = burn::backend::Metal<Elem>;
-#[cfg(all(feature = "wgpu", not(feature = "metal"), not(feature = "cuda")))]
-pub type Compute = burn::backend::Wgpu<Elem>;
-#[cfg(all(
-    feature = "cpu",
-    not(feature = "wgpu"),
-    not(feature = "metal"),
-    not(feature = "cuda")
-))]
-pub type Compute = burn::backend::NdArray<Elem>;
-
-// TODO: Same story here, we can just re-expose the flags.
-
-// Autodiff wrapper. `checkpoint` opts into Burn's BalancedCheckpointing strategy —
-// recompute cheap (elementwise) ops in backward instead of storing them, trading a
-// little compute for activation memory. Off by default
-#[cfg(not(feature = "checkpoint"))]
-pub type Train = burn::backend::Autodiff<Compute>;
-#[cfg(feature = "checkpoint")]
-pub type Train = burn::backend::Autodiff<
-    Compute,
-    burn::backend::autodiff::checkpoint::strategy::BalancedCheckpointing,
->;

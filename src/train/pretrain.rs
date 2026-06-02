@@ -1,9 +1,7 @@
 //! Pretraining stage using next-token cross-entropy.
 
 use crate::constants::{FINEWEB_REPO, NUM_WORKERS, SHUFFLE_SEED};
-use crate::data::{
-    MixSchedule, MixtureDataset, StreamingTokenDataset, TokenBatcher, load_tokenizer, swh_sources,
-};
+use crate::data::{MixSchedule, MixtureDataset, StreamingTokenDataset, TokenBatcher, swh_sources};
 use crate::train::TrainingContext;
 use burn::config::Config;
 use burn::data::dataloader::DataLoaderBuilder;
@@ -43,7 +41,7 @@ pub fn run(
     // Streaming corpus: dense seq_len+1 windows packed per row group, tokenized on
     // access.
     println!("indexing FineWeb-Edu shards...");
-    let tokenizer = std::sync::Arc::new(load_tokenizer()?);
+    let tokenizer = std::sync::Arc::new(crate::utils::load_tokenizer()?);
 
     let corpus = StreamingTokenDataset::from_hub(
         tokenizer.clone(),

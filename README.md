@@ -46,7 +46,7 @@ cargo run --profile=maxperf --features metal --bin serve -- model
 
 ### Crate Features
 
-When building either binary you should pick one backend feature i.e. `ndarray`/`metal`/`wgpu`/`cuda`. And then if on a backend where its supported you can use `bf16` to halve memory and compute for training. Adding the `checkpoint` feature enables activation checkpointing, which trades off a bit of memory for compute.
+When building either binary you should pick one backend feature i.e. `ndarray`/`metal`/`wgpu`/`cuda`. If on a backend where its supported you can use `bf16` to halve memory and compute for training. Adding the `checkpoint` feature enables activation checkpointing, which trades off a bit of memory for compute. Training requires the `train` feature.
 
 ## Resources
 

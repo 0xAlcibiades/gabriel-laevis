@@ -12,24 +12,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::config::artifact_dir;
-
-// ===========================================================================
-// Tokenizer
-// ===========================================================================
-
-/// Load the byte-level BPE tokenizer from `$MODEL_DIR/tokenizer.json` (run `train tokenizer`
-/// first — this errors rather than fetching anything).
-pub fn load_tokenizer() -> Result<fastokens::Tokenizer> {
-    let path = artifact_dir().join("tokenizer.json");
-    fastokens::Tokenizer::from_file(&path).wrap_err_with(|| {
-        format!(
-            "loading tokenizer from {} (run `train tokenizer` first)",
-            path.display()
-        )
-    })
-}
-
 // ===========================================================================
 // Dataset ingestion
 // ===========================================================================

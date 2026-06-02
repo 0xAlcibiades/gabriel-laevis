@@ -14,9 +14,7 @@ use crate::constants::{
     GRPO_COMPLETION_LEN, GRPO_GROUP_SIZE, GRPO_KL_BETA, GRPO_PROMPT_LEN, GSM8K_FILE, GSM8K_REPO,
     NUM_WORKERS, SHUFFLE_SEED,
 };
-use crate::data::{
-    GrpoBatch, GrpoBatcher, GrpoDataset, GrpoExample, load_gsm8k, load_tokenizer, split_valid,
-};
+use crate::data::{GrpoBatch, GrpoBatcher, GrpoDataset, GrpoExample, load_gsm8k, split_valid};
 use crate::model::GabrielLaevis;
 use crate::model::lm::{Sampling, sequence_logprob};
 use crate::train::TrainingContext;
@@ -352,7 +350,7 @@ pub fn run(
     let (examples, valid_examples) = split_valid(examples, VALID_PROMPTS);
 
     // Owned tokenizer for the batcher (re-loaded from cache; avoids needing Clone).
-    let tokenizer = std::sync::Arc::new(load_tokenizer().wrap_err("load tokenizer")?);
+    let tokenizer = std::sync::Arc::new(crate::utils::load_tokenizer().wrap_err("load tokenizer")?);
     let batcher = GrpoBatcher { tokenizer };
 
     // Slice into shared 1000-step checkpoint-epochs with auto-resume (see dpo/pretrain).
