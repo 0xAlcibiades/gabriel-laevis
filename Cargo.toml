@@ -41,6 +41,8 @@ fastrand = "2"
 flate2 = { version = "1", optional = true }
 hf-hub = { version = "0.5", optional = true }
 kanal = { version = "0.1", features = ["async"] }
+minijinja = { version = "2", features = ["loop_controls"] }
+minijinja-contrib = { version = "2", features = ["pycompat"] }
 moka = { version = "0.12", features = ["sync"], optional = true }
 parquet = { version = "58", default-features = false, features = ["snap", "zstd"], optional = true }
 rayon = { version = "1", optional = true }

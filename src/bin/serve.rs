@@ -12,6 +12,7 @@ use clap::Parser;
 use eyre::{Result, WrapErr};
 use fastokens::DecodeStream;
 use gabriel_laevis_0::Compute;
+use gabriel_laevis_0::chat::{Message, Role, SpecialToken, render};
 use gabriel_laevis_0::config::{ModelConfig, artifact_dir};
 use gabriel_laevis_0::model::GabrielLaevis;
 use gabriel_laevis_0::model::lm::Sampling;
@@ -53,6 +54,27 @@ struct ChatMessage {
     content: String,
 }
 
+/// OpenAI Chat Completions `reasoning_effort`. Accepted verbatim so any standard client works.
+/// This model is trained on a binary thinking toggle, so effort collapses to on/off internally:
+/// `none` is off, any real effort is on. Graded effort can be honored later with no API change.
+#[derive(Deserialize, Clone, Copy)]
+#[serde(rename_all = "lowercase")]
+enum ReasoningEffort {
+    None,
+    Minimal,
+    Low,
+    Medium,
+    High,
+    Xhigh,
+}
+
+impl ReasoningEffort {
+    /// Whether this effort enables the thinking channel.
+    fn enable_thinking(self) -> bool {
+        !matches!(self, ReasoningEffort::None)
+    }
+}
+
 #[derive(Deserialize)]
 struct ChatRequest {
     messages: Vec<ChatMessage>,
@@ -76,6 +98,8 @@ struct ChatRequest {
     seed: Option<u64>,
     #[serde(default)]
     stop: Vec<String>,
+    #[serde(default)]
+    reasoning_effort: Option<ReasoningEffort>,
 }
 
 #[derive(Deserialize)]
@@ -196,15 +220,31 @@ async fn chat_completions(
     State(state): State<Arc<AppState>>,
     Json(req): Json<ChatRequest>,
 ) -> Response {
-    let user = req
+    // Standard OpenAI `reasoning_effort` mapped to the model's binary thinking toggle: absent is
+    // on, `none` is off, any real effort is on.
+    let enable_thinking = req
+        .reasoning_effort
+        .map(ReasoningEffort::enable_thinking)
+        .unwrap_or(true);
+
+    // Map request turns to the template; the `<|think|>` cue is emitted by the template from
+    // `enable_thinking`, so request system messages other than user/assistant are dropped here.
+    let history: Vec<Message> = req
         .messages
         .iter()
-        .rev()
-        .find(|m| m.role == "user")
-        .map(|m| m.content.as_str())
-        .unwrap_or("");
+        .filter_map(|m| match Role::from_chatml(&m.role) {
+            Some(Role::User) => Some(Message::user(m.content.clone())),
+            Some(Role::Model) => Some(Message::assistant(m.content.clone())),
+            _ => None,
+        })
+        .collect();
+    let history = if history.is_empty() {
+        vec![Message::user(String::new())]
+    } else {
+        history
+    };
 
-    let prompt = gabriel_laevis_0::chat::render_prompt(user);
+    let prompt = render(&history, true, enable_thinking);
 
     let ids = match encode(&state, &prompt) {
         Ok(v) => v,
@@ -265,6 +305,13 @@ async fn completions(
 /// Drain the token channel into either an SSE stream of OpenAI delta chunks
 /// (`stream`) or a single completion response. `chat` selects message/delta vs
 /// text field shapes.
+///
+/// For chat, the thought channel is returned to the client in a separate `reasoning_content`
+/// field: tokens between `<|channel>` and `<channel|>`, detected by their special-token ids and
+/// never decoded, go to `reasoning_content` while the answer goes to `content`. Raw
+/// `/v1/completions` has no such field, so the thought is omitted there. Stop strings match the
+/// answer, not the thinking. `reasoning_content` is the DeepSeek/vLLM convention; OpenAI itself
+/// does not return reasoning in chat completions.
 async fn respond(
     state: Arc<AppState>,
     rx: AsyncReceiver<i64>,
@@ -272,6 +319,9 @@ async fn respond(
     chat: bool,
     stop: Vec<String>,
 ) -> Response {
+    let channel_open = SpecialToken::ChannelOpen as i64;
+    let channel_close = SpecialToken::ChannelClose as i64;
+
     if stream {
         let tok = state.tokenizer.clone();
 
@@ -283,20 +333,29 @@ async fn respond(
 
         let s = async_stream::stream! {
             let mut dec = DecodeStream::new(Vec::new(), true);
-            let mut full = String::new();
+            let mut content = String::new();
+            let mut in_thought = false;
             while let Ok(t) = rx.recv().await {
-                if let Ok(Some(text)) = dec.step(tok.as_ref(), vec![t as u32]) {
-                    full.push_str(&text);
-                    let choice = if chat {
-                        json!({"index": 0, "delta": {"content": text}, "finish_reason": null})
-                    } else {
-                        json!({"index": 0, "text": text, "finish_reason": null})
-                    };
-                    let chunk = json!({"id": NAME, "object": object, "model": NAME, "choices": [choice]});
-                    yield Ok::<Event, std::convert::Infallible>(Event::default().data(chunk.to_string()));
-                    if stop.iter().any(|s| !s.is_empty() && full.contains(s)) {
-                        break;
-                    }
+                // Channel markers are atomic special tokens; flip state, don't decode them.
+                if t == channel_open { in_thought = true; continue; }
+                if t == channel_close { in_thought = false; continue; }
+                let Ok(Some(text)) = dec.step(tok.as_ref(), vec![t as u32]) else { continue };
+                let choice = if in_thought {
+                    // Thought: chat surfaces it as `reasoning_content`; completions has no such
+                    // field, so drop it from the visible text.
+                    if !chat { continue; }
+                    json!({"index": 0, "delta": {"reasoning_content": text}, "finish_reason": null})
+                } else if chat {
+                    content.push_str(&text);
+                    json!({"index": 0, "delta": {"content": text}, "finish_reason": null})
+                } else {
+                    content.push_str(&text);
+                    json!({"index": 0, "text": text, "finish_reason": null})
+                };
+                let chunk = json!({"id": NAME, "object": object, "model": NAME, "choices": [choice]});
+                yield Ok::<Event, std::convert::Infallible>(Event::default().data(chunk.to_string()));
+                if !in_thought && stop.iter().any(|s| !s.is_empty() && content.contains(s)) {
+                    break;
                 }
             }
 
@@ -316,22 +375,40 @@ async fn respond(
         Sse::new(s).into_response()
     } else {
         let mut dec = DecodeStream::new(Vec::new(), true);
-
-        let mut full = String::new();
+        let mut content = String::new();
+        let mut reasoning = String::new();
+        let mut in_thought = false;
 
         while let Ok(t) = rx.recv().await {
-            if let Ok(Some(text)) = dec.step(state.tokenizer.as_ref(), vec![t as u32]) {
-                full.push_str(&text);
-                if stop.iter().any(|s| !s.is_empty() && full.contains(s)) {
+            if t == channel_open {
+                in_thought = true;
+                continue;
+            }
+            if t == channel_close {
+                in_thought = false;
+                continue;
+            }
+            let Ok(Some(text)) = dec.step(state.tokenizer.as_ref(), vec![t as u32]) else {
+                continue;
+            };
+            if in_thought {
+                reasoning.push_str(&text);
+            } else {
+                content.push_str(&text);
+                if stop.iter().any(|s| !s.is_empty() && content.contains(s)) {
                     break;
                 }
             }
         }
 
         let choice = if chat {
-            json!({"index": 0, "message": {"role": "assistant", "content": full}, "finish_reason": "stop"})
+            let mut message = json!({"role": "assistant", "content": content});
+            if !reasoning.is_empty() {
+                message["reasoning_content"] = json!(reasoning);
+            }
+            json!({"index": 0, "message": message, "finish_reason": "stop"})
         } else {
-            json!({"index": 0, "text": full, "finish_reason": "stop"})
+            json!({"index": 0, "text": content, "finish_reason": "stop"})
         };
 
         let object = if chat {

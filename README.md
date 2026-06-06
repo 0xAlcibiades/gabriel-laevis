@@ -13,6 +13,7 @@ A **Mamba-3** small language model implemented from scratch in [Burn](https://bu
 - **Backend:** cubecl makes it portable
 - **Tokenizer:** fastokens with byte-level BPE a la [nanochat](https://github.com/karpathy/nanochat)
 - **Architecture:** [Mamba-3](https://arxiv.org/abs/2603.15569) SISO with a Llama-style backbone; each block pairs a Mamba-3 mixer ([SSD](https://arxiv.org/abs/2405.21060) scan, half-[RoPE](https://arxiv.org/abs/2104.09864)) with a [SwiGLU](https://arxiv.org/abs/2002.05202) MLP, pre-norm [RMSNorm](https://arxiv.org/abs/1910.07467), tied embeddings.
+- **Chat format:** Gemma-4-style control tokens; a single Jinja chat template is the one render source — shared by `serve` and the training data path, and shipped beside the tokenizer for HuggingFace/vLLM — with a controllable `<|think|>` reasoning toggle.
 
 ## Status
 
@@ -32,9 +33,10 @@ Dimensions are runtime config knobs, so doing a larger run is a config change aw
 | -------------------- | ------------------------------------------------------------------------------------ |
 | `train pretrain`     | Pretrain on a decay-annealed web/math/code mix                                       |
 | `train sft`          | Instruction-tune (ChatML, response-masked)                                           |
-| `train dpo`          | Preference-optimize the SFT model                                                    |
-| `train grpo`         | RL on [GSM8K](https://huggingface.co/datasets/openai/gsm8k) with a verifiable reward |
-| `train all`          | Run all four stages in order                                                         |
+| `train reason`       | Teach chain-of-thought with an on/off toggle (R1-distilled CoT-trace SFT)            |
+| `train dpo`          | Preference-optimize against a frozen reference (DPO)                                 |
+| `train grpo`         | RL on [GSM8K](https://huggingface.co/datasets/openai/gsm8k), verifiable reward, reasoning-on rollouts |
+| `train all`          | Run all five stages in order                                                         |
 | `serve <checkpoint>` | OpenAI-compatible inference server                                                   |
 
 Each `train` stage continues from the prior stage's checkpoint and auto-resumes from the latest, e.g.:
@@ -43,6 +45,12 @@ Each `train` stage continues from the prior stage's checkpoint and auto-resumes 
 cargo run --profile=maxperf --features metal --bin train -- pretrain
 cargo run --profile=maxperf --features metal --bin serve -- model
 ```
+
+`MODEL_DIR` overrides where checkpoints, the config, and the tokenizer live (default `/tmp/gabriel-laevis`).
+
+### Reasoning
+
+The model has a controllable thinking channel, trained by `train reason` on R1-distilled CoT traces. At inference, set OpenAI's `reasoning_effort` on the chat request (`none`|`minimal`|`low`|`medium`|`high`|`xhigh`): `none` answers directly, anything else emits a `<|channel>thought>` chain-of-thought returned in a separate `reasoning_content` field (the DeepSeek/vLLM convention) while the answer goes to `content`.
 
 ### Crate Features
 
@@ -54,6 +62,7 @@ When building either binary you should pick one backend feature i.e. `ndarray`/`
 
 - [Burn](https://burn.dev) — Rust deep-learning framework on the cubecl GPU kernel layer.
 - [fastokens](https://github.com/crusoecloud/fastokens) — byte-level BPE tokenizer.
+- [minijinja](https://github.com/mitsuhiko/minijinja) — Jinja renderer for the chat template.
 
 **Models & data**
 
@@ -62,6 +71,7 @@ When building either binary you should pick one backend feature i.e. `ndarray`/`
 - [FineMath](https://huggingface.co/datasets/HuggingFaceTB/finemath) — math/reasoning pretraining corpus.
 - [Stack-Edu](https://huggingface.co/datasets/HuggingFaceTB/stack-edu) — code pretraining corpus.
 - [OpenAssistant (oasst_top1)](https://huggingface.co/datasets/OpenAssistant/oasst_top1_2023-08-25) — SFT instruction data.
+- [Llama-Nemotron-Post-Training-Dataset](https://huggingface.co/datasets/nvidia/Llama-Nemotron-Post-Training-Dataset) — R1-distilled CoT-trace reasoning SFT data.
 - [orpo-dpo-mix-40k](https://huggingface.co/datasets/mlabonne/orpo-dpo-mix-40k-flat) — DPO preference data.
 - [GSM8K](https://huggingface.co/datasets/openai/gsm8k) — GRPO task.
 

@@ -78,6 +78,16 @@ fn reward(completion: &str, answer: &str) -> f32 {
     }
 }
 
+/// The answer portion of a completion: everything after the final thought-channel close, so the
+/// verifiable reward keys on the answer rather than a number inside the CoT. A completion with no
+/// thought channel is returned whole.
+fn answer_portion(completion: &str) -> &str {
+    completion
+        .rsplit(crate::chat::SpecialToken::ChannelClose.as_str())
+        .next()
+        .unwrap_or(completion)
+}
+
 /// Sample `G` completions per prompt with `gen` and score them.
 fn sample_all<G: Backend>(
     sampler: &GabrielLaevis<G>,
@@ -115,8 +125,9 @@ fn sample_all<G: Backend>(
             .iter()
             .map(|comp| {
                 let ids: Vec<u32> = comp.iter().map(|&x| x as u32).collect();
-                let text = batch.tokenizer.decode(&ids, true).unwrap_or_default();
-                reward(&text, answer)
+                // Keep special tokens so `<channel|>` survives; score the post-thought answer.
+                let text = batch.tokenizer.decode(&ids, false).unwrap_or_default();
+                reward(answer_portion(&text), answer)
             })
             .collect();
 
@@ -283,9 +294,9 @@ impl<B: Backend> InferenceStep for GrpoModel<B> {
                 });
 
             let ids: Vec<u32> = g.iter().map(|&x| x as u32).collect();
-            let text = batch.tokenizer.decode(&ids, true).unwrap_or_default();
+            let text = batch.tokenizer.decode(&ids, false).unwrap_or_default();
 
-            if gsm8k_correct(&text, answer) {
+            if gsm8k_correct(answer_portion(&text), answer) {
                 pass1 += 1;
             }
         }
@@ -306,11 +317,13 @@ pub fn run(
     let cfg = ModelConfig::load(ctx.checkpoint_path("config.json")).wrap_err("loading config")?;
     cfg.validate()?;
 
-    // `--from` wins; otherwise chain off the freshest upstream checkpoint: DPO's output
-    // when present, else the SFT model. So SFT→DPO→GRPO composes, and SFT→GRPO still works.
+    // `--from` wins; otherwise chain off the freshest upstream checkpoint: DPO's output when
+    // present, else the reasoning model, else the SFT model. So the full chain composes and
+    // shorter chains that skip stages still work.
     let base = match from {
         Some(f) => f,
         None if ctx.has_checkpoint("model_dpo") => "model_dpo",
+        None if ctx.has_checkpoint("model_reason") => "model_reason",
         None => "model_sft",
     };
 
@@ -335,9 +348,11 @@ pub fn run(
     let examples: Vec<GrpoExample> = pairs
         .into_iter()
         .map(|(q, answer)| {
+            // Reasoning-on prompt: the `<|think|>` cue makes rollouts produce CoT then answer.
+            let rendered = crate::chat::render(&[crate::chat::Message::user(q)], true, true);
             let prompt: Vec<i64> = ctx
                 .tokenizer
-                .encode(&crate::chat::render_prompt(&q))
+                .encode(&rendered)
                 .wrap_err("encoding gsm8k prompt")?
                 .into_iter()
                 .take(GRPO_PROMPT_LEN) // truncate to the prompt budget as we collect
@@ -552,5 +567,17 @@ mod tests {
         assert!(!gsm8k_correct("the answer is 41", "42"));
         // Trailing prose after the number still resolves to the last integer.
         assert!(gsm8k_correct("42 dollars total, so 7 dozen", "7"));
+    }
+
+    #[test]
+    fn answer_portion_scopes_reward_to_post_thought() {
+        // The reward keys on text after the final `<channel|>`, so numbers inside the CoT can't
+        // hijack it; here the thought ends on 99 but the answer is 42.
+        let c = "<|channel>thought\nhmm maybe 99\n<channel|>So it is 42.";
+        assert_eq!(answer_portion(c).trim(), "So it is 42.");
+        assert!(gsm8k_correct(answer_portion(c), "42"));
+        assert!(!gsm8k_correct(answer_portion(c), "99"));
+        // No thought channel → whole completion is the answer.
+        assert_eq!(answer_portion("just 5"), "just 5");
     }
 }

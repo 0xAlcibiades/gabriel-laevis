@@ -142,6 +142,16 @@ pub fn run(vocab_size: usize, docs_per_domain: usize, out: Option<PathBuf>) -> R
         out.display()
     );
 
+    // Ship the chat template next to the tokenizer so external tooling formats conversations
+    // identically to `chat::render`. transformers >= 4.43 auto-loads a `chat_template.jinja`
+    // sitting beside the tokenizer files.
+    if let Some(parent) = out.parent() {
+        let tmpl_path = parent.join("chat_template.jinja");
+        std::fs::write(&tmpl_path, crate::chat::chat_template())
+            .wrap_err_with(|| format!("writing chat template to {}", tmpl_path.display()))?;
+        println!("saved chat template to {}", tmpl_path.display());
+    }
+
     verify(&out)?;
     Ok(())
 }

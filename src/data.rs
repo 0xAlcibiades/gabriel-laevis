@@ -759,30 +759,37 @@ fn oasst_thread(text: &str) -> Vec<crate::chat::Message> {
     turns
 }
 
-/// Build a padded `(inputs, targets)` row of length `seq_len` that trains only on
-/// `response`: the conversation `history` plus the open model turn is the `IGNORE_ID`-masked
-/// prefix, and the response with its closing `<turn|>` are the supervised targets.
-/// `render(history, true)` is a token prefix of the full render, which the masking relies on.
+/// Build a padded `(inputs, targets)` row of length `seq_len` that trains only on `response`: the
+/// `history` rendered through the chat template plus the open model turn is the `IGNORE_ID`-masked
+/// prefix; the response completion is the supervised target. The prompt is a literal prefix of the
+/// full string, so it stays a token prefix, which the masking relies on.
 fn build_masked_row(
     tok: &fastokens::Tokenizer,
     history: &[crate::chat::Message],
     response: &str,
     seq_len: usize,
 ) -> Result<(Vec<i64>, Vec<i64>)> {
-    let ignore = crate::chat::IGNORE_ID as i64;
-    let mut convo = history.to_vec();
-    convo.push(crate::chat::Message::assistant(response));
+    let prompt = crate::chat::render(history, true, false);
+    let prompt_len = tok.encode(&prompt).wrap_err("encoding sft prompt")?.len();
     let full: Vec<i64> = tok
-        .encode(&crate::chat::render(&convo, false))
+        .encode(&format!(
+            "{prompt}{}",
+            crate::chat::assistant_completion(response, None)
+        ))
         .wrap_err("encoding sft example")?
         .into_iter()
         .map(|x| x as i64)
         .collect();
-    let prompt_len = tok
-        .encode(&crate::chat::render(history, true))
-        .wrap_err("encoding sft prompt")?
-        .len();
+    Ok(fill_masked(&full, prompt_len, seq_len))
+}
 
+/// Build a padded `[seq_len]` `(inputs, targets)` pair from a token stream `full` and its
+/// prompt-prefix length: `inputs` is the shifted-input frame, `targets[j]` supervises the
+/// predicted token `full[j+1]` only where `j+1 >= prompt_len`; the prompt prefix and the padding
+/// tail stay `IGNORE_ID`. Clamps to `seq_len+1` tokens; callers that must not truncate guard the
+/// length and drop the row before calling this.
+fn fill_masked(full: &[i64], prompt_len: usize, seq_len: usize) -> (Vec<i64>, Vec<i64>) {
+    let ignore = crate::chat::IGNORE_ID as i64;
     let mut inputs = vec![ignore; seq_len];
     let mut targets = vec![ignore; seq_len];
     let n = full.len().min(seq_len + 1);
@@ -795,7 +802,7 @@ fn build_masked_row(
             ignore
         };
     }
-    Ok((inputs, targets))
+    (inputs, targets)
 }
 
 /// Build one padded row from a single-turn `(prompt, response)`. Used by DPO; a thin wrapper
@@ -865,6 +872,160 @@ impl<B: Backend> Batcher<B, (Vec<i64>, Vec<i64>), Batch<B>> for SftBatcher {
             targets: Tensor::<B, 2, Int>::from_data(TensorData::new(targets, [bsz, l]), device),
         }
     }
+}
+
+// ===========================================================================
+// Reasoning: distilled CoT-trace SFT
+// ===========================================================================
+
+// Nemotron SFT schema strings — the external dataset contract, named once.
+const COL_INPUT: &str = "input";
+const COL_OUTPUT: &str = "output";
+const COL_REASONING: &str = "reasoning";
+const COL_ROLE: &str = "role";
+const COL_CONTENT: &str = "content";
+const REASONING_ON: &str = "on";
+const REASONING_OFF: &str = "off";
+const THINK_OPEN: &str = "<think>";
+const THINK_CLOSE: &str = "</think>";
+
+/// Split a Nemotron-style `output` into `(thinking, content)`, driven by the `reasoning` column.
+/// `"on"` expects the output to begin with a literal `<think>…</think>` block followed by the
+/// trimmed answer; `"off"` is a direct answer with no thinking. Returns `None` for any
+/// malformed or empty row so the loader drops it: on-mode missing or empty `<think>`, text before
+/// `<think>`, or empty answer; off-mode empty content.
+pub fn parse_reason_output(reasoning: &str, output: &str) -> Option<(Option<String>, String)> {
+    match reasoning.trim() {
+        REASONING_ON => {
+            // Must start with the tag after leading whitespace; text before it is malformed.
+            let rest = output.trim_start().strip_prefix(THINK_OPEN)?;
+            let (thinking, content) = rest.split_once(THINK_CLOSE)?;
+            let (thinking, content) = (thinking.trim(), content.trim());
+            if thinking.is_empty() || content.is_empty() {
+                return None;
+            }
+            Some((Some(thinking.to_string()), content.to_string()))
+        }
+        REASONING_OFF => {
+            let content = output.trim();
+            (!content.is_empty()).then(|| (None, content.to_string()))
+        }
+        _ => None,
+    }
+}
+
+/// Build a padded, response-masked `(inputs, targets)` row from one reasoning example. The prompt
+/// is `history` rendered through the chat template with the `<|think|>` cue when `enable_thinking`;
+/// the supervised target is the assistant completion, an optional `<|channel>thought>` block then
+/// the answer, appended after the open model turn. Returns `Ok(None)` to drop the example when it
+/// doesn't fit `seq_len`: the full render exceeds `seq_len+1`, or the prompt alone reaches
+/// `seq_len`. It drops rather than truncate because a clipped CoT or an all-`IGNORE_ID` row is
+/// mis-training.
+pub fn build_reason_row(
+    tok: &fastokens::Tokenizer,
+    enable_thinking: bool,
+    history: &[crate::chat::Message],
+    thinking: Option<&str>,
+    content: &str,
+    seq_len: usize,
+) -> Result<Option<(Vec<i64>, Vec<i64>)>> {
+    let prompt = crate::chat::render(history, true, enable_thinking);
+    let prompt_len = tok
+        .encode(&prompt)
+        .wrap_err("encoding reason prompt")?
+        .len();
+    let full: Vec<i64> = tok
+        .encode(&format!(
+            "{prompt}{}",
+            crate::chat::assistant_completion(content, thinking)
+        ))
+        .wrap_err("encoding reason example")?
+        .into_iter()
+        .map(|x| x as i64)
+        .collect();
+    if full.len() > seq_len + 1 || prompt_len >= seq_len {
+        return Ok(None); // doesn't fit; drop rather than truncate
+    }
+    Ok(Some(fill_masked(&full, prompt_len, seq_len)))
+}
+
+/// Parse a Nemotron `input` column, a parquet list of `{role, content}` structs, into our message
+/// history. `user`/`assistant` map to their roles; `system` and any other roles are skipped, since
+/// the template emits the system turn from `enable_thinking`. Returns an empty vec if the field is
+/// not a message list.
+fn messages_from_input(field: &parquet::record::Field) -> Vec<crate::chat::Message> {
+    use parquet::record::Field;
+    let Field::ListInternal(list) = field else {
+        return Vec::new();
+    };
+    let mut msgs = Vec::new();
+    for el in list.elements() {
+        let Field::Group(g) = el else { continue };
+        let (mut role, mut content) = (None, None);
+        for (name, f) in g.get_column_iter() {
+            if let Field::Str(s) = f {
+                match name.as_str() {
+                    COL_ROLE => role = Some(s.as_str()),
+                    COL_CONTENT => content = Some(s.clone()),
+                    _ => {}
+                }
+            }
+        }
+        match (role.and_then(crate::chat::Role::from_chatml), content) {
+            (Some(crate::chat::Role::User), Some(c)) => msgs.push(crate::chat::Message::user(c)),
+            (Some(crate::chat::Role::Model), Some(c)) => {
+                msgs.push(crate::chat::Message::assistant(c))
+            }
+            _ => {} // skip system/developer/tool/unknown; the template emits the system turn
+        }
+    }
+    msgs
+}
+
+/// Load reasoning SFT rows from a Nemotron-style parquet file on the Hub, up to `max` usable rows.
+/// `input` is a nested list of `{role, content}` turns, so a leaf-index `column_index` lookup
+/// doesn't apply and top-level fields are read by name via `get_column_iter`. Reasoning-on rows
+/// render their CoT into the thought channel; reasoning-off rows are direct answers. Malformed and
+/// over-length rows are dropped and don't count toward `max`.
+pub fn load_reason_rows(
+    tok: &fastokens::Tokenizer,
+    repo: &str,
+    file: &str,
+    max: usize,
+    seq_len: usize,
+) -> Result<Vec<(Vec<i64>, Vec<i64>)>> {
+    use parquet::record::Field;
+    let reader = open_hub_dataset_parquet(repo, file)?;
+    read_rows(&reader, max, |row| {
+        // Top-level columns by name: input is nested, output/reasoning are plain strings.
+        let (mut out, mut reasoning, mut history) = (None, None, None);
+        for (name, field) in row.get_column_iter() {
+            match (name.as_str(), field) {
+                (COL_OUTPUT, Field::Str(s)) => out = Some(s.clone()),
+                (COL_REASONING, Field::Str(s)) => reasoning = Some(s.clone()),
+                (COL_INPUT, f) => history = Some(messages_from_input(f)),
+                _ => {}
+            }
+        }
+        let (Some(out), Some(reasoning), Some(history)) = (out, reasoning, history) else {
+            return Ok(None); // missing a required column
+        };
+        if history.is_empty() {
+            return Ok(None); // unreadable or empty input
+        }
+        let Some((thinking, content)) = parse_reason_output(&reasoning, &out) else {
+            return Ok(None); // malformed output
+        };
+        let enable_thinking = reasoning.trim() != REASONING_OFF;
+        build_reason_row(
+            tok,
+            enable_thinking,
+            &history,
+            thinking.as_deref(),
+            &content,
+            seq_len,
+        )
+    })
 }
 
 // ===========================================================================
@@ -1050,6 +1211,120 @@ mod tests {
         let json = serde_json::from_str(include_str!("../testdata/tokenizer.json"))
             .expect("fixture tokenizer json");
         fastokens::Tokenizer::from_json(json).expect("loading fixture tokenizer")
+    }
+
+    #[test]
+    fn parse_reason_output_splits_and_validates() {
+        // reasoning-on: split the <think>…</think> block from the answer.
+        assert_eq!(
+            parse_reason_output(
+                REASONING_ON,
+                &format!("{THINK_OPEN}add them{THINK_CLOSE}The answer is 4.")
+            ),
+            Some((Some("add them".to_string()), "The answer is 4.".to_string()))
+        );
+        // reasoning-off: direct answer, driven by the column.
+        assert_eq!(
+            parse_reason_output(REASONING_OFF, "The answer is 4."),
+            Some((None, "The answer is 4.".to_string()))
+        );
+        // Malformed reasoning-on rows are dropped.
+        assert_eq!(
+            parse_reason_output(REASONING_ON, "no think tags here"),
+            None
+        ); // missing tags
+        assert_eq!(
+            parse_reason_output(REASONING_ON, &format!("{THINK_OPEN}{THINK_CLOSE}ans")),
+            None
+        ); // empty thinking
+        assert_eq!(
+            parse_reason_output(
+                REASONING_ON,
+                &format!("{THINK_OPEN}reasoning{THINK_CLOSE}  ")
+            ),
+            None
+        ); // empty answer
+        assert_eq!(
+            parse_reason_output(REASONING_ON, &format!("junk{THINK_OPEN}r{THINK_CLOSE}a")),
+            None
+        ); // text before the tag
+        // Empty content is always a drop.
+        assert_eq!(parse_reason_output(REASONING_OFF, "   "), None);
+    }
+
+    #[test]
+    fn thinking_adds_supervised_targets() {
+        // The thought channel must be part of the supervised target span: building the same
+        // answer WITH a reasoning trace supervises strictly more tokens than without it.
+        let tok = fixture_tokenizer();
+        let seq_len = 256;
+        let ignore = crate::chat::IGNORE_ID as i64;
+        let user = [crate::chat::Message::user("2+2?")];
+        let with = build_reason_row(
+            &tok,
+            true,
+            &user,
+            Some("add two and two, carefully"),
+            "It is 4.",
+            seq_len,
+        )
+        .unwrap()
+        .expect("fits");
+        let without = build_reason_row(&tok, false, &user, None, "It is 4.", seq_len)
+            .unwrap()
+            .expect("fits");
+        let supervised = |r: &(Vec<i64>, Vec<i64>)| r.1.iter().filter(|&&t| t != ignore).count();
+        assert_eq!(with.0.len(), seq_len);
+        assert_eq!(with.1.len(), seq_len);
+        assert!(
+            supervised(&with) > supervised(&without),
+            "thinking tokens must be supervised: with={} without={}",
+            supervised(&with),
+            supervised(&without)
+        );
+    }
+
+    #[test]
+    fn reason_row_drops_when_over_length() {
+        // A seq_len so small the prompt alone overflows must drop the row, never emit a
+        // truncated or all-IGNORE row.
+        let tok = fixture_tokenizer();
+        let row = build_reason_row(
+            &tok,
+            true,
+            &[crate::chat::Message::user(
+                "a fairly long user question that will not fit",
+            )],
+            Some("a long chain of thought that overflows"),
+            "answer",
+            4,
+        )
+        .unwrap();
+        assert!(
+            row.is_none(),
+            "over-length row must be dropped, not clamped"
+        );
+    }
+
+    #[test]
+    fn prompt_is_token_prefix_of_full_with_thinking() {
+        // Masking relies on the rendered prompt being a token prefix of prompt++target, since the
+        // target is appended literally. Special tokens are atomic, so the boundary tokenizes
+        // identically. Pinned at the token level: a string-prefix check wouldn't catch a BPE merge
+        // crossing the <|turn>model / <|channel> boundary.
+        use crate::chat::{Message, assistant_completion, render};
+        let tok = fixture_tokenizer();
+        let prompt = render(&[Message::user("2+2?")], true, true);
+        let full = format!(
+            "{prompt}{}",
+            assistant_completion("It is 4.", Some("add two and two"))
+        );
+        let prompt_ids = tok.encode(&prompt).unwrap();
+        let full_ids = tok.encode(&full).unwrap();
+        assert!(
+            full_ids.starts_with(&prompt_ids),
+            "prompt must be a token prefix of prompt++target"
+        );
     }
 
     #[test]

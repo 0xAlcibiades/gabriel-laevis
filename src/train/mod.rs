@@ -4,6 +4,7 @@ pub mod context;
 pub mod dpo;
 pub mod grpo;
 pub mod pretrain;
+pub mod reason;
 pub mod sft;
 pub mod tokenizer;
 pub use context::TrainingContext;
