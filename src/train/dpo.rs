@@ -156,8 +156,13 @@ pub fn run(
         .wrap_err("loading config (run `train sft` first)")?;
     cfg.validate()?;
 
-    // Reference and policy both initialise from this base.
-    let base = from.unwrap_or("model_sft");
+    // Reference and policy both initialise from this base. `--from` wins; otherwise chain off the
+    // reasoning model when present, else the SFT model.
+    let base = match from {
+        Some(f) => f,
+        None if ctx.has_checkpoint("model_reason") => "model_reason",
+        None => "model_sft",
+    };
 
     println!("loading {DPO_REPO} up to {max_examples} pairs...");
     let triples =

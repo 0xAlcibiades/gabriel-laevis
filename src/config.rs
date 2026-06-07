@@ -217,6 +217,20 @@ pub fn run() -> &'static RunConfig {
     RUN.get_or_init(RunConfig::load)
 }
 
+/// The process-wide minijinja environment holding the parsed chat template, built once like
+/// [`run`]. pycompat enables the template's Python method calls and filters.
+pub fn chat_template_env() -> &'static minijinja::Environment<'static> {
+    use std::sync::OnceLock;
+    static ENV: OnceLock<minijinja::Environment<'static>> = OnceLock::new();
+    ENV.get_or_init(|| {
+        let mut env = minijinja::Environment::new();
+        env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
+        env.add_template("chat", crate::chat::CHAT_TEMPLATE)
+            .expect("chat template parses");
+        env
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

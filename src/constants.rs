@@ -16,6 +16,11 @@ pub const STACK_EDU_SHARD: &str = "Python/train/0000.parquet";
 pub const SFT_REPO: &str = "OpenAssistant/oasst_top1_2023-08-25";
 pub const SFT_FILE: &str = "default/train/0000.parquet";
 
+/// Reasoning SFT corpus
+pub const REASON_REPO: &str = "nvidia/Llama-Nemotron-Post-Training-Dataset";
+pub const REASON_MATH_FILE: &str = "SFT/partial-math/0000.parquet";
+pub const REASON_CHAT_FILE: &str = "SFT/partial-chat/0000.parquet";
+
 /// Dataloader defaults shared across every training stage.
 pub const SHUFFLE_SEED: u64 = 42;
 pub const NUM_WORKERS: usize = 2;
@@ -39,6 +44,11 @@ pub const GRPO_KL_BETA: f64 = 0.04;
 pub const SFT_SEQ_LEN: usize = 512;
 pub const DPO_SEQ_LEN: usize = 512;
 
-/// GRPO prompt and sampled-completion length caps.
+/// Reasoning SFT sequence length. CoT traces are longer than plain SFT responses; rows that
+/// exceed it are dropped, not truncated.
+pub const REASON_SEQ_LEN: usize = 2048;
+
+/// GRPO prompt and sampled-completion length caps. The completion cap leaves room for a
+/// chain-of-thought before the answer.
 pub const GRPO_PROMPT_LEN: usize = 256;
-pub const GRPO_COMPLETION_LEN: usize = 200;
+pub const GRPO_COMPLETION_LEN: usize = 1024;

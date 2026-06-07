@@ -2,7 +2,7 @@
 
 use clap::{Parser, Subcommand};
 use eyre::Result;
-use gabriel_laevis_0::train::{TrainingContext, dpo, grpo, pretrain, sft};
+use gabriel_laevis_0::train::{TrainingContext, dpo, grpo, pretrain, reason, sft};
 use std::path::PathBuf;
 
 /// Model training.
@@ -51,6 +51,18 @@ enum Stage {
         #[arg(long)]
         from: Option<String>,
     },
+    /// Teach chain-of-thought reasoning with a controllable on/off toggle.
+    Reason {
+        /// Reasoning examples to load, split evenly across the math and chat subsets.
+        #[arg(default_value_t = 10_000)]
+        max_examples: usize,
+        /// Passes over the data.
+        #[arg(default_value_t = 2)]
+        epochs: usize,
+        /// Base checkpoint to start from, e.g. `checkpoint/model-n`.
+        #[arg(long)]
+        from: Option<String>,
+    },
     /// Preference-optimize the SFT model with DPO.
     Dpo {
         /// Preference triples to load.
@@ -89,6 +101,12 @@ enum Stage {
         /// SFT passes over the data.
         #[arg(long, default_value_t = 2)]
         sft_epochs: usize,
+        /// Reasoning examples across math and chat.
+        #[arg(long, default_value_t = 10_000)]
+        reason_examples: usize,
+        /// Reasoning passes over the data.
+        #[arg(long, default_value_t = 2)]
+        reason_epochs: usize,
         /// DPO preference pairs.
         #[arg(long, default_value_t = 2000)]
         dpo_pairs: usize,
@@ -134,6 +152,11 @@ fn main() -> Result<()> {
             epochs,
             from,
         } => sft::run(&ctx, max_examples, epochs, from.as_deref())?,
+        Stage::Reason {
+            max_examples,
+            epochs,
+            from,
+        } => reason::run(&ctx, max_examples, epochs, from.as_deref())?,
         Stage::Dpo {
             max_pairs,
             epochs,
@@ -149,6 +172,8 @@ fn main() -> Result<()> {
             epochs,
             sft_examples,
             sft_epochs,
+            reason_examples,
+            reason_epochs,
             dpo_pairs,
             dpo_epochs,
             grpo_prompts,
@@ -156,6 +181,7 @@ fn main() -> Result<()> {
         } => {
             pretrain::run(&ctx, max_tokens, epochs, None)?;
             sft::run(&ctx, sft_examples, sft_epochs, None)?;
+            reason::run(&ctx, reason_examples, reason_epochs, None)?;
             dpo::run(&ctx, dpo_pairs, dpo_epochs, None)?;
             grpo::run(&ctx, grpo_prompts, grpo_epochs, None)?;
         }
